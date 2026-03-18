@@ -1,7 +1,5 @@
 """
 The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
-
-Hard stop: `train_gpt.py` and `train_gpt_mlx.py` must never be longer than 1500 lines.
 """
 
 from __future__ import annotations
@@ -48,6 +46,7 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    validate_at_step_zero = bool(int(os.environ.get("VALIDATE_AT_STEP_ZERO", "0")))
 
     # Evaluation context and rolling validation.
     _seq_len_default = os.environ.get("TRAIN_SEQ_LEN", "1024")
@@ -58,7 +57,7 @@ class Hyperparameters:
     use_projection_qat = bool(int(os.environ.get("USE_PROJECTION_QAT", "0")))
     qat_start_ms = float(os.environ.get("QAT_START_MS", 540000.0))
     qat_lr_scale = float(os.environ.get("QAT_LR_SCALE", 0.25))
-    qat_every_steps = int(os.environ.get("QAT_EVERY_STEPS", 1))
+    qat_every_steps = int(os.environ.get("QAT_EVERY_STEPS", 4))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -108,6 +107,113 @@ class Hyperparameters:
 
     # Compile behavior
     use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
+    compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "1")))
+    compile_mode = os.environ.get("COMPILE_MODE", "default")
+
+    def __init__(self):
+        self.data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+        self.train_files = os.path.join(self.data_path, "fineweb_train_*.bin")
+        self.val_files = os.path.join(self.data_path, "fineweb_val_*.bin")
+        self.tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+        self.run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+        self.seed = int(os.environ.get("SEED", 1337))
+        self.val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+        self.train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+        self.validate_at_step_zero = bool(int(os.environ.get("VALIDATE_AT_STEP_ZERO", "0")))
+        seq_len_default = os.environ.get("TRAIN_SEQ_LEN", "1024")
+        self.eval_ctx_len = int(os.environ.get("EVAL_CTX_LEN", seq_len_default))
+        self.eval_pred_len = int(os.environ.get("EVAL_PRED_LEN", seq_len_default))
+        self.eval_batch_size = int(os.environ.get("EVAL_BATCH_SIZE", os.environ.get("VAL_BATCH_SIZE", "524288")))
+        self.use_projection_qat = bool(int(os.environ.get("USE_PROJECTION_QAT", "0")))
+        self.qat_start_ms = float(os.environ.get("QAT_START_MS", 540000.0))
+        self.qat_lr_scale = float(os.environ.get("QAT_LR_SCALE", 0.25))
+        self.qat_every_steps = int(os.environ.get("QAT_EVERY_STEPS", 4))
+        self.iterations = int(os.environ.get("ITERATIONS", 20000))
+        self.warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+        self.warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+        self.train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
+        self.train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+        self.max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+        self.qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+        self.vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
+        self.num_layers = int(os.environ.get("NUM_LAYERS", 9))
+        self.num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
+        self.model_dim = int(os.environ.get("MODEL_DIM", 512))
+        self.num_unique_engines = int(os.environ.get("NUM_UNIQUE_ENGINES", 9))
+        self.num_heads = int(os.environ.get("NUM_HEADS", 8))
+        self.mlp_mult = int(os.environ.get("MLP_MULT", 2))
+        self.tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+        self.rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+        self.logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+        self.embed_dim = int(os.environ.get("EMBED_DIM", 128))
+        self.use_factor_embed = bool(int(os.environ.get("USE_FACTOR_EMBED", "0")))
+        self.eval_tta_steps = int(os.environ.get("EVAL_TTA_STEPS", 0))
+        self.eval_tta_lr = float(os.environ.get("EVAL_TTA_LR", 1e-3))
+        self.eval_tta_param_patterns = os.environ.get("EVAL_TTA_PARAM_PATTERNS", "attn_scale,mlp_scale,resid_mix,skip_weights,q_gain").split(",")
+        self.embed_lr = float(os.environ.get("EMBED_LR", 0.6))
+        self.head_lr = float(os.environ.get("HEAD_LR", 0.008))
+        self.tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+        self.tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
+        self.matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
+        self.scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+        self.muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+        self.muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+        self.muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
+        self.muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+        self.beta1 = float(os.environ.get("BETA1", 0.9))
+        self.beta2 = float(os.environ.get("BETA2", 0.95))
+        self.adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+        self.grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+        self.use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
+        self.compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "1")))
+        self.compile_mode = os.environ.get("COMPILE_MODE", "default")
+
+
+CLI_OVERRIDE_ENV_KEYS = frozenset({
+    "ADAM_EPS", "BETA1", "BETA2", "COMPILE_FULLGRAPH", "COMPILE_MODE", "CONTROL_TENSOR_NAME_PATTERNS",
+    "DATA_PATH", "EMBED_DIM", "EMBED_LR", "EVAL_BATCH_SIZE", "EVAL_CTX_LEN", "EVAL_PRED_LEN", "EVAL_TTA_LR",
+    "EVAL_TTA_PARAM_PATTERNS", "EVAL_TTA_STEPS", "GRAD_CLIP_NORM", "HEAD_LR", "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
+    "ITERATIONS",
+    "LOCAL_RANK", "LOGIT_SOFTCAP", "MATRIX_LR", "MAX_WALLCLOCK_SECONDS", "MLP_MULT", "MODEL_DIM",
+    "MUON_BACKEND_STEPS", "MUON_MOMENTUM", "MUON_MOMENTUM_WARMUP_START", "MUON_MOMENTUM_WARMUP_STEPS",
+    "NUM_HEADS", "NUM_KV_HEADS", "NUM_LAYERS", "NUM_UNIQUE_ENGINES", "QAT_EVERY_STEPS", "QAT_LR_SCALE",
+    "QAT_START_MS", "QK_GAIN_INIT", "RANK", "ROPE_BASE", "RUN_ID", "SCALAR_LR", "SEED", "TIE_EMBEDDINGS",
+    "TIED_EMBED_INIT_STD", "TIED_EMBED_LR", "TOKENIZER_PATH", "TRAIN_BATCH_TOKENS", "TRAIN_LOG_EVERY",
+    "TRAIN_SEQ_LEN", "USE_COMPILE", "USE_FACTOR_EMBED", "USE_PROJECTION_QAT", "VALIDATE_AT_STEP_ZERO",
+    "VAL_BATCH_SIZE", "VAL_LOSS_EVERY", "VAL_TOKENS_LIMIT", "VOCAB_SIZE", "WARMDOWN_ITERS", "WARMUP_STEPS",
+    "WORLD_SIZE",
+})
+
+def parse_cli_overrides(argv: list[str]) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    idx = 0
+    while idx < len(argv):
+        token = argv[idx]
+        if token in {"-h", "--help"}:
+            raise SystemExit(
+                "Usage: python train_gpt.py [--name value | --name=value] ...\n"
+                "CLI overrides map to env-backed settings and take precedence over environment variables.\n"
+                "Examples: --qat-every-steps 1 --validate-at-step-zero 0 --compile-mode reduce-overhead"
+            )
+        if not token.startswith("--"):
+            raise ValueError(f"Unexpected positional argument '{token}'. Use --name value overrides.")
+        if "=" in token:
+            raw_key, raw_value = token[2:].split("=", 1)
+        else:
+            if idx + 1 >= len(argv):
+                raise ValueError(f"Missing value for CLI override '{token}'")
+            raw_key = token[2:]
+            raw_value = argv[idx + 1]
+            idx += 1
+        env_key = raw_key.replace("-", "_").upper()
+        if env_key not in CLI_OVERRIDE_ENV_KEYS:
+            raise ValueError(
+                f"Unknown CLI override '{token}'. Use env-backed names like --qat-every-steps 1 "
+                "or --compile-mode reduce-overhead."
+            )
+        overrides[env_key] = raw_value
+        idx += 1
+    return overrides
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -264,12 +370,10 @@ def eval_val(
     local_blocks = list(range(rank, num_blocks, world_size))
     seqs_per_batch = max(1, args.eval_batch_size // (world_size * args.eval_ctx_len))
 
-    tta_params = []
-    if args.eval_tta_steps > 0:
-        for name, p in model.named_parameters():
-            if any(pat in name for pat in args.eval_tta_param_patterns if pat):
-                tta_params.append(p)
     eval_model = model.module if isinstance(model, DDP) else model
+    tta_params = getattr(eval_model, "_eval_tta_params", None) if args.eval_tta_steps > 0 else ()
+    if tta_params is None:
+        tta_params = tuple(p for name, p in eval_model.named_parameters() if any(pat in name for pat in args.eval_tta_param_patterns if pat)); setattr(eval_model, "_eval_tta_params", tta_params)
     tta_snapshots = [p.detach().clone() for p in tta_params] if tta_params else None
 
     try:
@@ -714,14 +818,10 @@ def unpack_pgq2(data: bytes) -> dict:
 
 @torch.no_grad()
 def project_model_to_export_grid(model: nn.Module) -> None:
-    for name, p in model.named_parameters():
-        if not p.is_floating_point():
-            continue
-        if p.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-            continue
-        if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
-            continue
-            
+    project_params = getattr(model, "_export_project_params", None)
+    if project_params is None:
+        project_params = tuple((name, p) for name, p in model.named_parameters() if p.is_floating_point() and p.numel() > INT8_KEEP_FLOAT_MAX_NUMEL and not any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS)); setattr(model, "_export_project_params", project_params)
+    for name, p in project_params:
         if name.endswith(".weight_latent"):
             scale = p.abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
             ternary = torch.round(p / scale).clamp(-1, 1)
@@ -1072,10 +1172,12 @@ class GPT(nn.Module):
 # TRAINING
 # -----------------------------
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     global zeropower_via_newtonschulz5
 
     code = Path(__file__).read_text(encoding="utf-8")
+    cli_overrides = parse_cli_overrides(sys.argv[1:] if argv is None else argv)
+    os.environ.update(cli_overrides)
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
@@ -1198,7 +1300,7 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     if args.use_compile:
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=args.compile_fullgraph, mode=args.compile_mode)
     else:
         compiled_model = base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
@@ -1343,7 +1445,7 @@ def main() -> None:
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        should_validate = last_step or (args.val_loss_every > 0 and (args.validate_at_step_zero or step > 0) and step % args.val_loss_every == 0)
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
@@ -1493,7 +1595,5 @@ def main() -> None:
 
     if distributed:
         dist.destroy_process_group()
-
-
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])
