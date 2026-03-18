@@ -53,7 +53,7 @@ class Hyperparameters:
     use_projection_qat = bool(int(os.environ.get("USE_PROJECTION_QAT", "0")))
     qat_start_ms = float(os.environ.get("QAT_START_MS", 540000.0))
     qat_lr_scale = float(os.environ.get("QAT_LR_SCALE", 0.25))
-    qat_every_steps = int(os.environ.get("QAT_EVERY_STEPS", 1))
+    qat_every_steps = int(os.environ.get("QAT_EVERY_STEPS", 4))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -109,6 +109,8 @@ class Hyperparameters:
     train_meta_every = int(os.environ.get("TRAIN_META_EVERY", 2))
     train_meta_start_frac = float(os.environ.get("TRAIN_META_START_FRAC", 0.70))
     train_meta_end_frac = float(os.environ.get("TRAIN_META_END_FRAC", 0.90))
+    train_meta_steps = int(os.environ.get("TRAIN_META_STEPS", 1))
+    train_meta_first_order = bool(int(os.environ.get("TRAIN_META_FIRST_ORDER", 1)))
 
     # Streaming eval with causal adaptation
     eval_window = int(os.environ.get("EVAL_WINDOW", 4096))
@@ -119,6 +121,190 @@ class Hyperparameters:
     # Compile behavior
     use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
     compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "0")))
+
+    def __init__(self):
+        # Data paths are shard globs produced by the existing preprocessing pipeline.
+        self.data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+        self.train_files = os.path.join(self.data_path, "fineweb_train_*.bin")
+        self.val_files = os.path.join(self.data_path, "fineweb_val_*.bin")
+        self.tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+        self.run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+        self.seed = int(os.environ.get("SEED", 1337))
+
+        # Validation cadence and batch size. Validation always uses the full fineweb_val split.
+        self.val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+        self.train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+
+        self.use_projection_qat = bool(int(os.environ.get("USE_PROJECTION_QAT", "0")))
+        self.qat_start_ms = float(os.environ.get("QAT_START_MS", 540000.0))
+        self.qat_lr_scale = float(os.environ.get("QAT_LR_SCALE", 0.25))
+        self.qat_every_steps = int(os.environ.get("QAT_EVERY_STEPS", 4))
+
+        # Training length.
+        self.iterations = int(os.environ.get("ITERATIONS", 20000))
+        self.warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+        self.warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+        self.train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
+        self.train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+        self.max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+        self.qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+
+        # Model shape.
+        self.vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
+        self.num_layers = int(os.environ.get("NUM_LAYERS", 9))
+        self.num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
+        self.model_dim = int(os.environ.get("MODEL_DIM", 512))
+        unique_default = os.environ.get("NUM_UNIQUE_ENGINES", "9")
+        self.num_heads = int(os.environ.get("NUM_HEADS", 8))
+        self.mlp_mult = int(os.environ.get("MLP_MULT", 2))
+        self.tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+        self.rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+        self.logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+
+        # Optimizer hyperparameters.
+        self.embed_lr = float(os.environ.get("EMBED_LR", 0.6))
+        self.head_lr = float(os.environ.get("HEAD_LR", 0.008))
+        self.tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+        self.tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
+        self.matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
+        self.scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+        self.muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+        self.muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+        self.muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
+        self.muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+        self.beta1 = float(os.environ.get("BETA1", 0.9))
+        self.beta2 = float(os.environ.get("BETA2", 0.95))
+        self.adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+        self.grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+        # Factorized embeddings
+        self.use_factor_embed = bool(int(os.environ.get("USE_FACTOR_EMBED", "0")))
+        self.embed_dim = int(os.environ.get("EMBED_DIM", 128))
+
+        # Partial sharing
+        self.num_unique_attn = int(os.environ.get("NUM_UNIQUE_ATTN", unique_default))
+        self.num_unique_mlp = int(os.environ.get("NUM_UNIQUE_MLP", unique_default))
+
+        # Fast online adapters
+        self.use_fast_adapters = bool(int(os.environ.get("USE_FAST_ADAPTERS", "0")))
+        self.fast_rank = int(os.environ.get("FAST_RANK", 16))
+        self.fast_grad_clip = float(os.environ.get("FAST_GRAD_CLIP", 0.1))
+
+        # Meta-style training schedule
+        self.train_meta_every = int(os.environ.get("TRAIN_META_EVERY", 2))
+        self.train_meta_start_frac = float(os.environ.get("TRAIN_META_START_FRAC", 0.70))
+        self.train_meta_end_frac = float(os.environ.get("TRAIN_META_END_FRAC", 0.90))
+        self.train_meta_steps = int(os.environ.get("TRAIN_META_STEPS", 1))
+        self.train_meta_first_order = bool(int(os.environ.get("TRAIN_META_FIRST_ORDER", 1)))
+
+        # Streaming eval with causal adaptation
+        self.eval_window = int(os.environ.get("EVAL_WINDOW", 4096))
+        self.eval_adapt = int(os.environ.get("EVAL_ADAPT", 3072))
+        self.eval_score = int(os.environ.get("EVAL_SCORE", 1024))
+        self.eval_ttt_steps = int(os.environ.get("EVAL_TTT_STEPS", 0))
+
+        # Compile behavior
+        self.use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
+        self.compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "0")))
+
+
+CLI_OVERRIDE_ENV_KEYS = frozenset({
+    "ADAM_EPS",
+    "BETA1",
+    "BETA2",
+    "COMPILE_FULLGRAPH",
+    "CONTROL_TENSOR_NAME_PATTERNS",
+    "DATA_PATH",
+    "EMBED_DIM",
+    "EMBED_LR",
+    "EVAL_ADAPT",
+    "EVAL_SCORE",
+    "EVAL_TTT_STEPS",
+    "EVAL_WINDOW",
+    "FAST_GRAD_CLIP",
+    "FAST_RANK",
+    "GRAD_CLIP_NORM",
+    "HEAD_LR",
+    "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
+    "LOCAL_RANK",
+    "LOGIT_SOFTCAP",
+    "MATRIX_LR",
+    "MAX_WALLCLOCK_SECONDS",
+    "MLP_MULT",
+    "MODEL_DIM",
+    "MUON_BACKEND_STEPS",
+    "MUON_MOMENTUM",
+    "MUON_MOMENTUM_WARMUP_START",
+    "MUON_MOMENTUM_WARMUP_STEPS",
+    "NUM_HEADS",
+    "NUM_KV_HEADS",
+    "NUM_LAYERS",
+    "NUM_UNIQUE_ATTN",
+    "NUM_UNIQUE_ENGINES",
+    "NUM_UNIQUE_MLP",
+    "QAT_EVERY_STEPS",
+    "QAT_LR_SCALE",
+    "QAT_START_MS",
+    "QK_GAIN_INIT",
+    "RANK",
+    "ROPE_BASE",
+    "RUN_ID",
+    "SCALAR_LR",
+    "SEED",
+    "TIE_EMBEDDINGS",
+    "TIED_EMBED_INIT_STD",
+    "TIED_EMBED_LR",
+    "TOKENIZER_PATH",
+    "TRAIN_BATCH_TOKENS",
+    "TRAIN_LOG_EVERY",
+    "TRAIN_META_END_FRAC",
+    "TRAIN_META_EVERY",
+    "TRAIN_META_FIRST_ORDER",
+    "TRAIN_META_START_FRAC",
+    "TRAIN_META_STEPS",
+    "TRAIN_SEQ_LEN",
+    "USE_COMPILE",
+    "USE_FACTOR_EMBED",
+    "USE_FAST_ADAPTERS",
+    "USE_PROJECTION_QAT",
+    "VAL_LOSS_EVERY",
+    "VAL_TOKENS_LIMIT",
+    "VOCAB_SIZE",
+    "WARMDOWN_ITERS",
+    "WARMUP_STEPS",
+    "WORLD_SIZE",
+})
+
+def parse_cli_overrides(argv: list[str]) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    idx = 0
+    while idx < len(argv):
+        token = argv[idx]
+        if token in {"-h", "--help"}:
+            raise SystemExit(
+                "Usage: python train_gpt_moonshot.py [--name value | --name=value] ...\n"
+                "CLI overrides map to env-backed settings and take precedence over environment variables.\n"
+                "Examples: --qat-every-steps 1 --train-meta-first-order=0 --use-fast-adapters 1"
+            )
+        if not token.startswith("--"):
+            raise ValueError(f"Unexpected positional argument '{token}'. Use --name value overrides.")
+        if "=" in token:
+            raw_key, raw_value = token[2:].split("=", 1)
+        else:
+            if idx + 1 >= len(argv):
+                raise ValueError(f"Missing value for CLI override '{token}'")
+            raw_key = token[2:]
+            raw_value = argv[idx + 1]
+            idx += 1
+        env_key = raw_key.replace("-", "_").upper()
+        if env_key not in CLI_OVERRIDE_ENV_KEYS:
+            raise ValueError(
+                f"Unknown CLI override '{token}'. Use env-backed names like --qat-every-steps 1 "
+                "or --train-meta-first-order 0."
+            )
+        overrides[env_key] = raw_value
+        idx += 1
+    return overrides
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -261,6 +447,8 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    fast_state_keys: tuple[str, ...] = (),
+    adapters: tuple[LowRankFastAdapter, ...] = (),
 ) -> tuple[float, float]:
     total_targets = val_tokens.numel() - 1
     num_blocks = math.ceil(total_targets / args.eval_score)
@@ -272,8 +460,6 @@ def eval_val(
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    fast_state_keys = build_fast_state_keys(args.num_unique_attn, args.num_unique_mlp)
-    adapters = iter_fast_adapters(model) if args.use_fast_adapters else []
     model.eval()
 
     for block_id in range(block_start, block_end):
@@ -302,6 +488,7 @@ def eval_val(
                 steps=args.eval_ttt_steps,
                 clip=args.fast_grad_clip,
                 create_graph=False,
+                adapters=adapters,
             )
 
         mask = torch.zeros_like(y_full, dtype=torch.float32)
@@ -369,6 +556,19 @@ def build_fast_state_keys(num_unique_attn: int, num_unique_mlp: int) -> tuple[st
     return tuple(keys)
 
 FAST_STATE_KEYS = build_fast_state_keys(3, 3)
+
+def get_export_project_params(model: nn.Module) -> tuple[tuple[str, Tensor], ...]:
+    cached = getattr(model, "_export_project_params", None)
+    if cached is None:
+        cached = tuple(
+            (name, p)
+            for name, p in model.named_parameters()
+            if p.is_floating_point()
+            and p.numel() > INT8_KEEP_FLOAT_MAX_NUMEL
+            and not any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS)
+        )
+        setattr(model, "_export_project_params", cached)
+    return cached
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -689,14 +889,7 @@ def unpack_pgq2(data: bytes) -> dict:
 
 @torch.no_grad()
 def project_model_to_export_grid(model: nn.Module) -> None:
-    for name, p in model.named_parameters():
-        if not p.is_floating_point():
-            continue
-        if p.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-            continue
-        if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
-            continue
-            
+    for name, p in get_export_project_params(model):
         if name.endswith(".weight_latent"):
             scale = p.abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
             ternary = torch.round(p / scale).clamp(-1, 1)
@@ -1176,42 +1369,47 @@ def adapt_fast_state(
     steps: int,
     clip: float,
     create_graph: bool = False,
+    detach_result: bool | None = None,
+    adapters: tuple[LowRankFastAdapter, ...] | None = None,
+    initial_loss: Tensor | None = None,
 ) -> dict[str, Tensor]:
-    adapters = iter_fast_adapters(model)
+    adapters = tuple(iter_fast_adapters(model) if adapters is None else adapters)
     state = {k: v.clone().detach().requires_grad_(True) for k, v in fast_state.items()}
+    if detach_result is None:
+        detach_result = not create_graph
+    active_adapters = tuple(a for a in adapters if a.key in state)
+    if not active_adapters or steps <= 0:
+        return detach_fast_state(state) if detach_result else state
 
-    for _ in range(steps):
-        loss = model(x_prefix, y_prefix, fast_state=state)
+    for step_idx in range(steps):
+        loss = initial_loss if step_idx == 0 and initial_loss is not None else model(x_prefix, y_prefix, fast_state=state)
         grads = torch.autograd.grad(
             loss,
-            [state[a.key] for a in adapters if a.key in state],
+            [state[a.key] for a in active_adapters],
             create_graph=create_graph,
-            retain_graph=create_graph,
+            retain_graph=create_graph or (step_idx == 0 and initial_loss is not None),
             allow_unused=False,
         )
-        grad_map = {a.key: g for a, g in zip([a for a in adapters if a.key in state], grads, strict=True)}
-
         next_state = {}
-        for a in adapters:
-            if a.key not in state:
-                continue
-            g = grad_map[a.key]
+        for a, g in zip(active_adapters, grads, strict=True):
             g_norm = g.norm()
             if clip > 0:
                 g = g * (clip / g_norm.clamp_min(clip))
             next_state[a.key] = a.decay() * state[a.key] - a.lr() * g
         state = next_state
 
-    return state if create_graph else detach_fast_state(state)
+    return detach_fast_state(state) if detach_result else state
 
 # -----------------------------
 # TRAINING
 # -----------------------------
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     global zeropower_via_newtonschulz5
 
     code = Path(__file__).read_text(encoding="utf-8")
+    cli_overrides = parse_cli_overrides(sys.argv[1:] if argv is None else argv)
+    os.environ.update(cli_overrides)
     args = Hyperparameters()
     if args.model_dim % args.num_heads != 0:
         raise ValueError("MODEL_DIM must be divisible by NUM_HEADS")
@@ -1219,6 +1417,10 @@ def main() -> None:
         raise ValueError(f"NUM_UNIQUE_ATTN must be in [1, NUM_LAYERS], got {args.num_unique_attn}")
     if not 1 <= args.num_unique_mlp <= args.num_layers:
         raise ValueError(f"NUM_UNIQUE_MLP must be in [1, NUM_LAYERS], got {args.num_unique_mlp}")
+    if args.qat_every_steps <= 0:
+        raise ValueError(f"QAT_EVERY_STEPS must be positive, got {args.qat_every_steps}")
+    if args.train_meta_steps < 0:
+        raise ValueError(f"TRAIN_META_STEPS must be non-negative, got {args.train_meta_steps}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1348,6 +1550,13 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    fast_state_keys = build_fast_state_keys(args.num_unique_attn, args.num_unique_mlp) if args.use_fast_adapters else ()
+    fast_adapters = tuple(iter_fast_adapters(base_model)) if args.use_fast_adapters else ()
+    zero_fast_state_template = (
+        init_fast_state(args.fast_rank, device, fast_state_keys)
+        if fast_adapters
+        else None
+    )
 
     if args.use_compile:
         compiled_model = torch.compile(
@@ -1517,6 +1726,8 @@ def main() -> None:
                 base_bytes_lut,
                 has_leading_space_lut,
                 is_boundary_token_lut,
+                fast_state_keys=fast_state_keys,
+                adapters=fast_adapters,
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
@@ -1537,6 +1748,7 @@ def main() -> None:
         meta_active = (
             args.use_fast_adapters
             and args.train_meta_every > 0
+            and args.train_meta_steps > 0
             and args.train_meta_start_frac <= progress < args.train_meta_end_frac
             and (step % args.train_meta_every == 0)
         )
@@ -1561,11 +1773,7 @@ def main() -> None:
                 x_b = local[pair_tokens : 2 * pair_tokens].reshape(-1, args.train_seq_len)
                 y_b = local[pair_tokens + 1 : 2 * pair_tokens + 1].reshape(-1, args.train_seq_len)
 
-                zero_state = init_fast_state(
-                    args.fast_rank,
-                    device,
-                    build_fast_state_keys(args.num_unique_attn, args.num_unique_mlp),
-                )
+                zero_state = clone_fast_state(zero_fast_state_template) if zero_fast_state_template is not None else {}
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     loss_a = model(x_a, y_a, fast_state=zero_state)
                     fast_state_1 = adapt_fast_state(
@@ -1573,9 +1781,12 @@ def main() -> None:
                         zero_state,
                         x_a,
                         y_a,
-                        steps=1,
+                        steps=args.train_meta_steps,
                         clip=args.fast_grad_clip,
-                        create_graph=True,
+                        create_graph=not args.train_meta_first_order,
+                        detach_result=False,
+                        adapters=fast_adapters,
+                        initial_loss=loss_a,
                     )
                     loss_b = model(x_b, y_b, fast_state=fast_state_1)
                     loss = 0.2 * loss_a + 0.8 * loss_b
@@ -1689,6 +1900,8 @@ def main() -> None:
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
+        fast_state_keys=fast_state_keys,
+        adapters=fast_adapters,
     )
     torch.cuda.synchronize()
     log0(
@@ -1702,4 +1915,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])
