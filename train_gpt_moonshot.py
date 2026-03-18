@@ -310,6 +310,22 @@ def parse_cli_overrides(argv: list[str]) -> dict[str, str]:
         idx += 1
     return overrides
 
+LOW_PRECISION_DTYPE = torch.bfloat16
+
+
+def resolve_low_precision_dtype(device: torch.device) -> torch.dtype:
+    override = os.environ.get("LOW_PRECISION_DTYPE", "auto").strip().lower()
+    if override in {"", "auto"}:
+        return torch.bfloat16 if torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
+    if override in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if override in {"fp16", "float16"}:
+        return torch.float16
+    raise ValueError(
+        f"LOW_PRECISION_DTYPE must be one of auto, bf16, bfloat16, fp16, float16; got {override!r}"
+    )
+
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -321,7 +337,7 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
     # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16()
+    X = G.to(dtype=LOW_PRECISION_DTYPE)
     X /= X.norm() + eps
     transposed = G.size(0) > G.size(1)
     if transposed:
@@ -361,7 +377,7 @@ class Muon(torch.optim.Optimizer):
             nesterov = group["nesterov"]
 
             total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=LOW_PRECISION_DTYPE)
 
             curr = 0
             for i, p in enumerate(params):
@@ -499,7 +515,7 @@ def eval_val(
         mask[:, prefix_len : prefix_len + (score_end - score_start)] = 1.0
 
         with torch.no_grad():
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            with torch.autocast(device_type="cuda", dtype=LOW_PRECISION_DTYPE, enabled=True):
                 batch_loss = model(x_full, y_full, fast_state=fast_state, loss_mask=mask)
 
         batch_token_count = float(score_end - score_start)
@@ -600,7 +616,7 @@ def unpack_ternary(packed: Tensor, original_shape: tuple, device: torch.device) 
     unpacked = (packed.to(device).unsqueeze(1).to(torch.int32) // powers) % 3
     unpacked = unpacked.flatten() - 1
     numel = math.prod(original_shape)
-    return unpacked[:numel].view(original_shape).to(torch.bfloat16)
+    return unpacked[:numel].view(original_shape).to(LOW_PRECISION_DTYPE)
 
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
@@ -705,7 +721,7 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             shape = tuple(qmeta_item["shape"])
             ternary = unpack_ternary(q, shape, "cpu")
             sparsity = ternary.float().abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
-            out[name] = (ternary.float() * scale.float() / sparsity).to(torch.bfloat16).contiguous()
+            out[name] = (ternary.float() * scale.float() / sparsity).to(LOW_PRECISION_DTYPE).contiguous()
             continue
 
         dtype = getattr(torch, obj["dtypes"][name])
@@ -1000,7 +1016,7 @@ class RMSNorm(nn.Module):
 
 
 class CastedLinear(nn.Linear):
-    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for low-precision compute.
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, self.weight.to(x.dtype), bias)
@@ -1008,7 +1024,7 @@ class CastedLinear(nn.Linear):
 class BitLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, bias: bool = False):
         super().__init__()
-        self.weight_latent = nn.Parameter(torch.empty(out_features, in_features, dtype=torch.bfloat16))
+        self.weight_latent = nn.Parameter(torch.empty(out_features, in_features, dtype=LOW_PRECISION_DTYPE))
         nn.init.normal_(self.weight_latent, std=0.02)
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features))
@@ -1055,7 +1071,7 @@ class LowRankFastAdapter(nn.Module):
         return self.gate.to(dtype=x.dtype) * h + dummy
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
-    # Keep small/control parameters in fp32 even when the model body runs in bf16.
+    # Keep small/control parameters in fp32 even when the model body runs in low precision.
     with torch.no_grad():
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
@@ -1410,7 +1426,7 @@ def adapt_fast_state(
 # -----------------------------
 
 def main(argv: list[str] | None = None) -> None:
-    global zeropower_via_newtonschulz5
+    global LOW_PRECISION_DTYPE, zeropower_via_newtonschulz5
 
     code = Path(__file__).read_text(encoding="utf-8")
     cli_overrides = parse_cli_overrides(sys.argv[1:] if argv is None else argv)
@@ -1426,7 +1442,6 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError(f"QAT_EVERY_STEPS must be positive, got {args.qat_every_steps}")
     if args.train_meta_steps < 0:
         raise ValueError(f"TRAIN_META_STEPS must be non-negative, got {args.train_meta_steps}")
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1458,6 +1473,8 @@ def main(argv: list[str] | None = None) -> None:
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
+    LOW_PRECISION_DTYPE = resolve_low_precision_dtype(device)
+    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
     if distributed:
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
@@ -1496,6 +1513,7 @@ def main(argv: list[str] | None = None) -> None:
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
+    log0(f"low_precision_dtype:{str(LOW_PRECISION_DTYPE).removeprefix('torch.')}")
     log0(
         subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
         console=False,
@@ -1550,7 +1568,7 @@ def main(argv: list[str] | None = None) -> None:
         num_unique_mlp=args.num_unique_mlp,
         use_fast_adapters=args.use_fast_adapters,
         fast_rank=args.fast_rank,
-    ).to(device).bfloat16()
+    ).to(device=device, dtype=LOW_PRECISION_DTYPE)
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1688,7 +1706,7 @@ def main(argv: list[str] | None = None) -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                with torch.autocast(device_type="cuda", dtype=LOW_PRECISION_DTYPE, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1783,7 +1801,7 @@ def main(argv: list[str] | None = None) -> None:
                 y_b = local[pair_tokens + 1 : 2 * pair_tokens + 1].reshape(-1, args.train_seq_len)
 
                 zero_state = clone_fast_state(zero_fast_state_template) if zero_fast_state_template is not None else {}
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                with torch.autocast(device_type="cuda", dtype=LOW_PRECISION_DTYPE, enabled=True):
                     loss_a = model(x_a, y_a, fast_state=zero_state)
                     fast_state_1 = adapt_fast_state(
                         model,
@@ -1810,7 +1828,7 @@ def main(argv: list[str] | None = None) -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                with torch.autocast(device_type="cuda", dtype=LOW_PRECISION_DTYPE, enabled=True):
                     loss = model(x, y)
                 train_loss += loss.detach()
                 (loss * grad_scale).backward()
