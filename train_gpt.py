@@ -108,6 +108,9 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # Compile behavior
+    use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -1158,7 +1161,10 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    if args.use_compile:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    else:
+        compiled_model = base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
