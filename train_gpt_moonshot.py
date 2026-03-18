@@ -799,7 +799,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor) -> Tensor:
-        return F.rms_norm(x, (self.weight.shape[0],), weight=self.weight, eps=self.eps)
+        return F.rms_norm(x, (self.weight.shape[0],), weight=self.weight.to(dtype=x.dtype), eps=self.eps)
 
 
 class CastedLinear(nn.Linear):
@@ -1262,9 +1262,9 @@ def main() -> None:
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
     use_cudnn_sdp = False
-    use_flash_sdp = True
-    use_mem_efficient_sdp = False
-    use_math_sdp = False
+    use_flash_sdp = torch.cuda.get_device_capability(device)[0] >= 8
+    use_mem_efficient_sdp = True
+    use_math_sdp = True
     enable_cudnn_sdp(use_cudnn_sdp)
     enable_flash_sdp(use_flash_sdp)
     enable_mem_efficient_sdp(use_mem_efficient_sdp)
