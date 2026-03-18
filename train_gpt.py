@@ -1513,9 +1513,16 @@ def main(argv: list[str] | None = None) -> None:
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        log_all_steps = args.iterations <= args.train_log_every
         should_log_train = (
             args.train_log_every > 0
-            and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
+            and (
+                log_all_steps
+                or step <= 10
+                or step % args.train_log_every == 0
+                or step == args.iterations
+                or stop_after_step is not None
+            )
         )
         if should_log_train:
             log0(
