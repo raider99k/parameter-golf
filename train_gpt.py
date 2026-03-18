@@ -320,8 +320,8 @@ def eval_val(
         val_token_count += batch_token_count
         
         for j, (y_t, m_t, x_t) in enumerate(zip(ys, masks, xs)):
-            scored_y = y_t[m_t == 1.0]
-            scored_x = x_t[m_t == 1.0]
+            scored_y = y_t[m_t == 1.0].to(torch.int64)
+            scored_x = x_t[m_t == 1.0].to(torch.int64)
             if scored_y.numel() == 0:
                 continue
             token_bytes = base_bytes_lut[scored_y].to(dtype=torch.int16)

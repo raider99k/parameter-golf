@@ -842,13 +842,16 @@ class LowRankFastAdapter(nn.Module):
         return torch.sigmoid(self.logit_decay)
 
     def delta(self, x: Tensor, fast_state: dict[str, Tensor] | None) -> Tensor:
+        dummy = (0.0 * self.log_lr + 0.0 * self.logit_decay + 0.0 * self.gate + 0.0 * self.u_basis.sum() + 0.0 * self.v_basis.sum()).to(dtype=x.dtype)
         if fast_state is None or self.key not in fast_state:
             return torch.zeros((*x.shape[:-1], self.u_basis.shape[0]), device=x.device, dtype=x.dtype)
+            return torch.zeros((*x.shape[:-1], self.u_basis.shape[0]), device=x.device, dtype=x.dtype) + dummy
         b = fast_state[self.key].to(dtype=x.dtype)
         h = F.linear(x, self.v_basis.to(dtype=x.dtype))
         h = F.linear(h, b)
         h = F.linear(h, self.u_basis.to(dtype=x.dtype))
         return self.gate.to(dtype=x.dtype) * h
+        return self.gate.to(dtype=x.dtype) * h + dummy
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
@@ -1484,6 +1487,7 @@ def main() -> None:
             val_loss, val_bpb = eval_val(
                 args,
                 model,
+                compiled_model,
                 rank,
                 world_size,
                 device,
@@ -1537,8 +1541,10 @@ def main() -> None:
                 zero_state = init_fast_state(args.fast_rank, device)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     loss_a = model(x_a, y_a, fast_state=zero_state)
+                    loss_a = compiled_model(x_a, y_a, fast_state=zero_state)
                     fast_state_1 = adapt_fast_state(
                         model,
+                        compiled_model,
                         zero_state,
                         x_a,
                         y_a,
@@ -1651,6 +1657,7 @@ def main() -> None:
     q_val_loss, q_val_bpb = eval_val(
         args,
         model,
+        compiled_model,
         rank,
         world_size,
         device,
