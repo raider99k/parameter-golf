@@ -61,10 +61,10 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 12))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
-    num_heads = int(os.environ.get("NUM_HEADS", 8))
+    model_dim = int(os.environ.get("MODEL_DIM", 1536))
+    num_heads = int(os.environ.get("NUM_HEADS", 12))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -318,6 +318,23 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
+def pack_ternary(ternary_tensor: Tensor) -> Tensor:
+    shifted = ternary_tensor.flatten() + 1 
+    pad_len = (5 - (shifted.numel() % 5)) % 5
+    if pad_len > 0:
+        shifted = torch.cat([shifted, torch.zeros(pad_len, device=shifted.device, dtype=shifted.dtype)])
+    shifted = shifted.view(-1, 5).to(torch.uint8)
+    powers = torch.tensor([1, 3, 9, 27, 81], dtype=torch.uint8, device=shifted.device)
+    packed = (shifted * powers).sum(dim=1, dtype=torch.uint8)
+    return packed.cpu()
+
+def unpack_ternary(packed: Tensor, original_shape: tuple, device: torch.device) -> Tensor:
+    powers = torch.tensor([1, 3, 9, 27, 81], dtype=torch.int32, device=device)
+    unpacked = (packed.to(device).unsqueeze(1).to(torch.int32) // powers) % 3
+    unpacked = unpacked.flatten() - 1
+    numel = math.prod(original_shape)
+    return unpacked[:numel].view(original_shape).to(torch.bfloat16)
+
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
@@ -362,6 +379,17 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         stats["num_tensors"] += 1
         stats["baseline_tensor_bytes"] += tensor_nbytes(t)
 
+        if name.endswith(".weight_latent"):
+            scale = t.abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
+            ternary = torch.round(t / scale).clamp(-1, 1).to(torch.int8)
+            packed = pack_ternary(ternary)
+            qmeta[name] = {"scheme": "ternary_packed", "shape": list(t.shape)}
+            quantized[name] = packed
+            scales[name] = scale
+            dtypes[name] = "ternary"
+            stats["int8_payload_bytes"] += tensor_nbytes(packed) + tensor_nbytes(scale)
+            continue
+
         if not t.is_floating_point():
             stats["num_nonfloat_tensors"] += 1
             passthrough[name] = t
@@ -403,6 +431,14 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     qmeta = obj.get("qmeta", {})
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
     for name, q in obj["quantized"].items():
+        qmeta_item = qmeta.get(name, {})
+        scheme = qmeta_item.get("scheme")
+        if scheme == "ternary_packed":
+            scale = obj["scales"][name]
+            shape = tuple(qmeta_item["shape"])
+            out[name] = (unpack_ternary(q, shape, "cpu") * scale).to(torch.bfloat16).contiguous()
+            continue
+
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
         if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
@@ -498,12 +534,13 @@ class DistributedTokenLoader:
 # -----------------------------
 
 class RMSNorm(nn.Module):
-    def __init__(self, eps: float | None = None):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor) -> Tensor:
-        return F.rms_norm(x, (x.size(-1),), eps=self.eps)
+        return F.rms_norm(x, (self.weight.shape[0],), weight=self.weight, eps=self.eps)
 
 
 class CastedLinear(nn.Linear):
@@ -511,6 +548,23 @@ class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, self.weight.to(x.dtype), bias)
+
+class BitLinear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+        super().__init__()
+        self.weight_latent = nn.Parameter(torch.empty(out_features, in_features, dtype=torch.bfloat16))
+        nn.init.normal_(self.weight_latent, std=0.02)
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter('bias', None)
+            
+    def forward(self, x: Tensor) -> Tensor:
+        scale = self.weight_latent.abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
+        weight_ternary = torch.round(self.weight_latent / scale).clamp(-1, 1)
+        w = weight_ternary.detach() - self.weight_latent.detach() + self.weight_latent
+        bias = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(x, w * scale, bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -572,10 +626,10 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
+        self.c_q = BitLinear(dim, dim, bias=False)
+        self.c_k = BitLinear(dim, kv_dim, bias=False)
+        self.c_v = BitLinear(dim, kv_dim, bias=False)
+        self.proj = BitLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
@@ -608,8 +662,8 @@ class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
+        self.fc = BitLinear(dim, hidden, bias=False)
+        self.proj = BitLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
@@ -617,7 +671,7 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
-class Block(nn.Module):
+class SharedTransformerEngine(nn.Module):
     def __init__(
         self,
         dim: int,
@@ -628,20 +682,24 @@ class Block(nn.Module):
         qk_gain_init: float,
     ):
         super().__init__()
-        self.attn_norm = RMSNorm()
-        self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
+
+
+class ModulatedTransformerLayer(nn.Module):
+    def __init__(self, engine: SharedTransformerEngine, dim: int):
+        super().__init__()
+        self.engine = engine
+        self.attn_norm = RMSNorm(dim)
+        self.mlp_norm = RMSNorm(dim)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+    def forward(self, x: Tensor) -> Tensor:
+        attn_out = self.engine.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        mlp_out = self.engine.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         return x
 
 
@@ -667,24 +725,14 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                )
-                for i in range(num_layers)
-            ]
+        self.shared_engine = SharedTransformerEngine(
+            model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init
         )
-        self.final_norm = RMSNorm()
+        self.layers = nn.ModuleList([
+            ModulatedTransformerLayer(self.shared_engine, model_dim)
+            for _ in range(num_layers)
+        ])
+        self.final_norm = RMSNorm(model_dim)
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -694,23 +742,18 @@ class GPT(nn.Module):
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
-            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
-                nn.init.zeros_(module.weight)
+            if getattr(module, "_zero_init", False):
+                if hasattr(module, "weight_latent"):
+                    nn.init.zeros_(module.weight_latent)
+                elif hasattr(module, "weight"):
+                    nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
-        x0 = x
-        skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        for layer in self.layers:
+            x = layer(x)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -848,19 +891,23 @@ def main() -> None:
     # - untied lm_head (Adam) uses HEAD_LR
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
-    block_named_params = list(base_model.blocks.named_parameters())
+    all_named_params = list(base_model.named_parameters())
     matrix_params = [
         p
-        for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        for name, p in all_named_params
+        if p.ndim == 2 and "weight_latent" in name and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
+    matrix_param_ids = {id(p) for p in matrix_params}
+    embed_param_ids = {id(base_model.tok_emb.weight)}
+    if base_model.lm_head is not None:
+        embed_param_ids.add(id(base_model.lm_head.weight))
+        
     scalar_params = [
         p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        for name, p in all_named_params
+        if id(p) not in matrix_param_ids and id(p) not in embed_param_ids
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
