@@ -1371,7 +1371,6 @@ def adapt_fast_state(
     create_graph: bool = False,
     detach_result: bool | None = None,
     adapters: tuple[LowRankFastAdapter, ...] | None = None,
-    initial_loss: Tensor | None = None,
 ) -> dict[str, Tensor]:
     adapters = tuple(iter_fast_adapters(model) if adapters is None else adapters)
     state = {k: v.clone().detach().requires_grad_(True) for k, v in fast_state.items()}
@@ -1382,12 +1381,14 @@ def adapt_fast_state(
         return detach_fast_state(state) if detach_result else state
 
     for step_idx in range(steps):
-        loss = initial_loss if step_idx == 0 and initial_loss is not None else model(x_prefix, y_prefix, fast_state=state)
+        # Recompute the prefix loss from the exact state being adapted.
+        # Cached outer losses are often detached from this internal clone,
+        # which would make autograd.grad see an unused tensor.
+        loss = model(x_prefix, y_prefix, fast_state=state)
         grads = torch.autograd.grad(
             loss,
             [state[a.key] for a in active_adapters],
             create_graph=create_graph,
-            retain_graph=create_graph or (step_idx == 0 and initial_loss is not None),
             allow_unused=False,
         )
         next_state = {}
@@ -1786,7 +1787,6 @@ def main(argv: list[str] | None = None) -> None:
                         create_graph=not args.train_meta_first_order,
                         detach_result=False,
                         adapters=fast_adapters,
-                        initial_loss=loss_a,
                     )
                     loss_b = model(x_b, y_b, fast_state=fast_state_1)
                     loss = 0.2 * loss_a + 0.8 * loss_b
