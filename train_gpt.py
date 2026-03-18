@@ -271,62 +271,91 @@ def eval_val(
         for name, p in model.named_parameters():
             if any(pat in name for pat in args.eval_tta_param_patterns if pat):
                 tta_params.append(p)
+    eval_model = model.module if isinstance(model, DDP) else model
+    tta_snapshots = [p.detach().clone() for p in tta_params] if tta_params else None
 
-    for i in range(0, len(local_blocks), seqs_per_batch):
-        batch_bids = local_blocks[i:i+seqs_per_batch]
+    try:
+        for i in range(0, len(local_blocks), seqs_per_batch):
+            batch_bids = local_blocks[i:i+seqs_per_batch]
             
-        xs, ys, masks = [], [], []
-        for bid in batch_bids:
-            score_start = bid * args.eval_pred_len
-            score_end = min(score_start + args.eval_pred_len, total_targets)
-            if score_end <= score_start:
+            xs, ys, masks = [], [], []
+            for bid in batch_bids:
+                score_start = bid * args.eval_pred_len
+                score_end = min(score_start + args.eval_pred_len, total_targets)
+                if score_end <= score_start:
+                    continue
+                ctx_start = max(0, score_start - args.eval_ctx_len)
+            
+                x = val_tokens[ctx_start:score_end]
+                y = val_tokens[ctx_start + 1:score_end + 1]
+            
+                mask = torch.zeros(y.numel(), dtype=torch.float32)
+                scored_len = score_end - score_start
+                if scored_len > 0:
+                    mask[-scored_len:] = 1.0
+            
+                xs.append(x)
+                ys.append(y)
+                masks.append(mask)
+        
+            if not xs:
                 continue
-            ctx_start = max(0, score_start - args.eval_ctx_len)
             
-            x = val_tokens[ctx_start:score_end]
-            y = val_tokens[ctx_start + 1:score_end + 1]
+            pad_len = args.eval_ctx_len + args.eval_pred_len
+            x_padded = torch.zeros((seqs_per_batch, pad_len), dtype=torch.int64)
+            y_padded = torch.zeros((seqs_per_batch, pad_len), dtype=torch.int64)
+            mask_padded = torch.zeros((seqs_per_batch, pad_len), dtype=torch.float32)
+            adapt_mask_padded = torch.zeros((seqs_per_batch, pad_len), dtype=torch.float32) if tta_params else None
+        
+            for j, (x, y, m) in enumerate(zip(xs, ys, masks)):
+                x_padded[j, -x.numel():] = x
+                y_padded[j, -y.numel():] = y
+                mask_padded[j, -m.numel():] = m
+                if adapt_mask_padded is not None:
+                    scored_len = int(m.sum().item())
+                    if scored_len < y.numel():
+                        adapt_mask_padded[j, -y.numel(): -scored_len if scored_len > 0 else None] = 1.0
             
-            mask = torch.zeros(y.numel(), dtype=torch.float32)
-            scored_len = score_end - score_start
-            if scored_len > 0:
-                mask[-scored_len:] = 1.0
-            
-            xs.append(x)
-            ys.append(y)
-            masks.append(mask)
+            x_padded = x_padded.to(device=device, non_blocking=True)
+            y_padded = y_padded.to(device=device, non_blocking=True)
+            mask_padded = mask_padded.to(device=device, non_blocking=True)
+            if adapt_mask_padded is not None:
+                adapt_mask_padded = adapt_mask_padded.to(device=device, non_blocking=True)
         
-        if not xs:
-            continue
-            
-        pad_len = args.eval_ctx_len + args.eval_pred_len
-        x_padded = torch.zeros((seqs_per_batch, pad_len), dtype=torch.int64)
-        y_padded = torch.zeros((seqs_per_batch, pad_len), dtype=torch.int64)
-        mask_padded = torch.zeros((seqs_per_batch, pad_len), dtype=torch.float32)
+            if adapt_mask_padded is not None and adapt_mask_padded.sum().item() > 0:
+                for _ in range(args.eval_tta_steps):
+                    eval_model.zero_grad(set_to_none=True)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        adapt_loss = eval_model(x_padded, y_padded, loss_mask=adapt_mask_padded)
+                    adapt_loss.backward()
+                    with torch.no_grad():
+                        for p in tta_params:
+                            if p.grad is not None:
+                                p.add_(p.grad, alpha=-args.eval_tta_lr)
+                eval_model.zero_grad(set_to_none=True)
+
+            with torch.no_grad():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    loss = model(x_padded, y_padded, loss_mask=mask_padded)
         
-        for j, (x, y, m) in enumerate(zip(xs, ys, masks)):
-            x_padded[j, -x.numel():] = x
-            y_padded[j, -y.numel():] = y
-            mask_padded[j, -m.numel():] = m
-            
-        x_padded = x_padded.to(device=device, non_blocking=True)
-        y_padded = y_padded.to(device=device, non_blocking=True)
-        mask_padded = mask_padded.to(device=device, non_blocking=True)
+            batch_token_count = mask_padded.sum().item()
+            val_loss_sum += loss.detach().to(torch.float64) * batch_token_count
+            val_token_count += batch_token_count
         
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-            loss = model(x_padded, y_padded, loss_mask=mask_padded)
-        
-        batch_token_count = mask_padded.sum().item()
-        val_loss_sum += loss.detach().to(torch.float64) * batch_token_count
-        val_token_count += batch_token_count
-        
-        for j, (y_t, m_t, x_t) in enumerate(zip(ys, masks, xs)):
-            scored_y = y_t[m_t == 1.0].to(torch.int64)
-            scored_x = x_t[m_t == 1.0].to(torch.int64)
-            if scored_y.numel() == 0:
-                continue
-            token_bytes = base_bytes_lut[scored_y].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[scored_y] & ~is_boundary_token_lut[scored_x]).to(dtype=torch.int16)
-            val_byte_count += token_bytes.to(torch.float64).sum().item()
+            for j, (y_t, m_t, x_t) in enumerate(zip(ys, masks, xs)):
+                scored_y = y_t[m_t == 1.0].to(torch.int64)
+                scored_x = x_t[m_t == 1.0].to(torch.int64)
+                if scored_y.numel() == 0:
+                    continue
+                token_bytes = base_bytes_lut[scored_y].to(dtype=torch.int16)
+                token_bytes += (has_leading_space_lut[scored_y] & ~is_boundary_token_lut[scored_x]).to(dtype=torch.int16)
+                val_byte_count += token_bytes.to(torch.float64).sum().item()
+    finally:
+        if tta_snapshots is not None:
+            with torch.no_grad():
+                for p, snapshot in zip(tta_params, tta_snapshots):
+                    p.copy_(snapshot)
+        model.train()
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
@@ -336,7 +365,6 @@ def eval_val(
     val_loss = val_loss_sum / val_token_count
     bits_per_token = val_loss.item() / math.log(2.0)
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
-    model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 # -----------------------------
@@ -1074,6 +1102,12 @@ def main() -> None:
     if distributed:
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
+    if args.train_batch_tokens <= 0 or args.train_seq_len <= 0:
+        raise ValueError("TRAIN_BATCH_TOKENS and TRAIN_SEQ_LEN must be positive")
+    if args.train_batch_tokens % (8 * args.train_seq_len) != 0:
+        raise ValueError(
+            f"TRAIN_BATCH_TOKENS={args.train_batch_tokens} must be divisible by 8 * TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
     master_process = rank == 0
 
     # Fast math knobs

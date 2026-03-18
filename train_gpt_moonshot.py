@@ -277,7 +277,12 @@ def eval_val(
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    fast_state = init_fast_state(args.fast_rank, device)
+    fast_state = init_fast_state(
+        args.fast_rank,
+        device,
+        build_fast_state_keys(args.num_unique_attn, args.num_unique_mlp),
+    )
+    adapters = iter_fast_adapters(model)
     model.eval()
 
     for block_id in range(block_start, block_end):
@@ -293,7 +298,7 @@ def eval_val(
         y_full = local[1:].unsqueeze(0)
 
         prefix_len = score_start - prefix_start
-        if prefix_len > 0 and args.eval_ttt_steps > 0:
+        if prefix_len > 0 and args.eval_ttt_steps > 0 and adapters:
             x_prefix = x_full[:, :prefix_len]
             y_prefix = y_full[:, :prefix_len]
             fast_state = adapt_fast_state(
@@ -363,6 +368,14 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+
+def build_fast_state_keys(num_unique_attn: int, num_unique_mlp: int) -> tuple[str, ...]:
+    keys = [f"attn_v_{i}" for i in range(num_unique_attn)]
+    keys.extend(f"mlp_fc_{i}" for i in range(num_unique_mlp))
+    keys.append("out")
+    return tuple(keys)
+
+FAST_STATE_KEYS = build_fast_state_keys(3, 3)
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -844,13 +857,11 @@ class LowRankFastAdapter(nn.Module):
     def delta(self, x: Tensor, fast_state: dict[str, Tensor] | None) -> Tensor:
         dummy = (0.0 * self.log_lr + 0.0 * self.logit_decay + 0.0 * self.gate + 0.0 * self.u_basis.sum() + 0.0 * self.v_basis.sum()).to(dtype=x.dtype)
         if fast_state is None or self.key not in fast_state:
-            return torch.zeros((*x.shape[:-1], self.u_basis.shape[0]), device=x.device, dtype=x.dtype)
             return torch.zeros((*x.shape[:-1], self.u_basis.shape[0]), device=x.device, dtype=x.dtype) + dummy
         b = fast_state[self.key].to(dtype=x.dtype)
         h = F.linear(x, self.v_basis.to(dtype=x.dtype))
         h = F.linear(h, b)
         h = F.linear(h, self.u_basis.to(dtype=x.dtype))
-        return self.gate.to(dtype=x.dtype) * h
         return self.gate.to(dtype=x.dtype) * h + dummy
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -1151,8 +1162,6 @@ class GPT(nn.Module):
         mask = loss_mask.reshape(-1).to(dtype=losses.dtype)
         denom = mask.sum().clamp_min(1.0)
         return (losses * mask).sum() / denom
-
-FAST_STATE_KEYS = ("attn_v_0", "attn_v_1", "attn_v_2", "mlp_fc_0", "mlp_fc_1", "mlp_fc_2", "out")
 
 def init_fast_state(rank: int, device: torch.device, keys: tuple[str, ...] = FAST_STATE_KEYS) -> dict[str, Tensor]:
     return {k: torch.zeros(rank, rank, device=device, dtype=torch.float32) for k in keys}
@@ -1487,7 +1496,6 @@ def main() -> None:
             val_loss, val_bpb = eval_val(
                 args,
                 model,
-                compiled_model,
                 rank,
                 world_size,
                 device,
@@ -1538,13 +1546,15 @@ def main() -> None:
                 x_b = local[args.train_seq_len : 2 * args.train_seq_len].unsqueeze(0)
                 y_b = local[args.train_seq_len + 1 : 2 * args.train_seq_len + 1].unsqueeze(0)
 
-                zero_state = init_fast_state(args.fast_rank, device)
+                zero_state = init_fast_state(
+                    args.fast_rank,
+                    device,
+                    build_fast_state_keys(args.num_unique_attn, args.num_unique_mlp),
+                )
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     loss_a = model(x_a, y_a, fast_state=zero_state)
-                    loss_a = compiled_model(x_a, y_a, fast_state=zero_state)
                     fast_state_1 = adapt_fast_state(
                         model,
-                        compiled_model,
                         zero_state,
                         x_a,
                         y_a,
@@ -1657,7 +1667,6 @@ def main() -> None:
     q_val_loss, q_val_bpb = eval_val(
         args,
         model,
-        compiled_model,
         rank,
         world_size,
         device,
