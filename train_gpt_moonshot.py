@@ -49,6 +49,7 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    validate_at_step_zero = bool(int(os.environ.get("VALIDATE_AT_STEP_ZERO", "0")))
 
     use_projection_qat = bool(int(os.environ.get("USE_PROJECTION_QAT", "0")))
     qat_start_ms = float(os.environ.get("QAT_START_MS", 540000.0))
@@ -134,6 +135,7 @@ class Hyperparameters:
         # Validation cadence and batch size. Validation always uses the full fineweb_val split.
         self.val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
         self.train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+        self.validate_at_step_zero = bool(int(os.environ.get("VALIDATE_AT_STEP_ZERO", "0")))
 
         self.use_projection_qat = bool(int(os.environ.get("USE_PROJECTION_QAT", "0")))
         self.qat_start_ms = float(os.environ.get("QAT_START_MS", 540000.0))
@@ -268,6 +270,7 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "USE_FACTOR_EMBED",
     "USE_FAST_ADAPTERS",
     "USE_PROJECTION_QAT",
+    "VALIDATE_AT_STEP_ZERO",
     "VAL_LOSS_EVERY",
     "VAL_TOKENS_LIMIT",
     "VOCAB_SIZE",
@@ -1714,7 +1717,11 @@ def main(argv: list[str] | None = None) -> None:
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        should_validate = last_step or (
+            args.val_loss_every > 0
+            and (args.validate_at_step_zero or step > 0)
+            and step % args.val_loss_every == 0
+        )
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
