@@ -1114,12 +1114,12 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
 
         for i in range(self.num_encoder_layers):
-            x = self.blocksi
+            x = self.blocks[i](x, x0, fast_state=fast_state)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocksself.num_encoder_layers + i
+            x = self.blocks[self.num_encoder_layers + i](x, x0, fast_state=fast_state)
 
         x = self.final_norm(x)
         if self.out_fast is not None:
