@@ -314,7 +314,7 @@ def eval_val(
         mask = torch.zeros_like(y_full, dtype=torch.float32)
         mask[:, prefix_len : prefix_len + (score_end - score_start)] = 1.0
 
-        with torch.inference_mode():
+        with torch.no_grad():
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 batch_loss = model(x_full, y_full, fast_state=fast_state, loss_mask=mask)
 
