@@ -213,6 +213,9 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
+    limit = int(os.environ.get("VAL_TOKENS_LIMIT", "0"))
+    if limit > 0 and usable > limit:
+        usable = (limit // seq_len) * seq_len
     return tokens[: usable + 1]
 
 
