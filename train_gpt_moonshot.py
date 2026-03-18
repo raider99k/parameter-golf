@@ -47,15 +47,8 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 1337))
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
-    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
-
-    # Evaluation context and rolling validation.
-    _seq_len_default = os.environ.get("TRAIN_SEQ_LEN", "1024")
-    eval_ctx_len = int(os.environ.get("EVAL_CTX_LEN", _seq_len_default))
-    eval_pred_len = int(os.environ.get("EVAL_PRED_LEN", _seq_len_default))
-    eval_batch_size = int(os.environ.get("EVAL_BATCH_SIZE", os.environ.get("VAL_BATCH_SIZE", "524288")))
 
     use_projection_qat = bool(int(os.environ.get("USE_PROJECTION_QAT", "0")))
     qat_start_ms = float(os.environ.get("QAT_START_MS", 540000.0))
@@ -73,11 +66,11 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 12))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 1536))
-    num_unique_engines = int(os.environ.get("NUM_UNIQUE_ENGINES", 1))
-    num_heads = int(os.environ.get("NUM_HEADS", 12))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    _unique_default = os.environ.get("NUM_UNIQUE_ENGINES", "9")
+    num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -100,15 +93,15 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
     # Factorized embeddings
-    use_factor_embed = bool(int(os.environ.get("USE_FACTOR_EMBED", "1")))
+    use_factor_embed = bool(int(os.environ.get("USE_FACTOR_EMBED", "0")))
     embed_dim = int(os.environ.get("EMBED_DIM", 128))
 
     # Partial sharing
-    num_unique_attn = int(os.environ.get("NUM_UNIQUE_ATTN", 3))
-    num_unique_mlp = int(os.environ.get("NUM_UNIQUE_MLP", 3))
+    num_unique_attn = int(os.environ.get("NUM_UNIQUE_ATTN", _unique_default))
+    num_unique_mlp = int(os.environ.get("NUM_UNIQUE_MLP", _unique_default))
 
     # Fast online adapters
-    use_fast_adapters = bool(int(os.environ.get("USE_FAST_ADAPTERS", "1")))
+    use_fast_adapters = bool(int(os.environ.get("USE_FAST_ADAPTERS", "0")))
     fast_rank = int(os.environ.get("FAST_RANK", 16))
     fast_grad_clip = float(os.environ.get("FAST_GRAD_CLIP", 0.1))
 
@@ -121,7 +114,7 @@ class Hyperparameters:
     eval_window = int(os.environ.get("EVAL_WINDOW", 4096))
     eval_adapt = int(os.environ.get("EVAL_ADAPT", 3072))
     eval_score = int(os.environ.get("EVAL_SCORE", 1024))
-    eval_ttt_steps = int(os.environ.get("EVAL_TTT_STEPS", 1))
+    eval_ttt_steps = int(os.environ.get("EVAL_TTT_STEPS", 0))
 
     # Compile behavior
     use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
@@ -245,11 +238,14 @@ def build_sentencepiece_luts(
     )
 
 
-def load_validation_tokens(pattern: str, seq_len: int = 1024) -> Tensor:
+def load_validation_tokens(pattern: str) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
+    limit = int(os.environ.get("VAL_TOKENS_LIMIT", "0"))
+    if limit > 0 and tokens.numel() > limit:
+        tokens = tokens[:limit]
     if tokens.numel() <= 1:
         raise ValueError("Validation split is too short")
     return tokens
@@ -261,7 +257,6 @@ def eval_val(
     rank: int,
     world_size: int,
     device: torch.device,
-    grad_accum_steps: int,
     val_tokens: Tensor,
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
@@ -277,12 +272,8 @@ def eval_val(
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    fast_state = init_fast_state(
-        args.fast_rank,
-        device,
-        build_fast_state_keys(args.num_unique_attn, args.num_unique_mlp),
-    )
-    adapters = iter_fast_adapters(model)
+    fast_state_keys = build_fast_state_keys(args.num_unique_attn, args.num_unique_mlp)
+    adapters = iter_fast_adapters(model) if args.use_fast_adapters else []
     model.eval()
 
     for block_id in range(block_start, block_end):
@@ -298,7 +289,9 @@ def eval_val(
         y_full = local[1:].unsqueeze(0)
 
         prefix_len = score_start - prefix_start
+        fast_state = None
         if prefix_len > 0 and args.eval_ttt_steps > 0 and adapters:
+            fast_state = init_fast_state(args.fast_rank, device, fast_state_keys)
             x_prefix = x_full[:, :prefix_len]
             y_prefix = y_full[:, :prefix_len]
             fast_state = adapt_fast_state(
@@ -450,7 +443,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         stats["baseline_tensor_bytes"] += tensor_nbytes(t)
 
         if name.endswith(".weight_latent"):
-            scale = t.abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
+            scale = t.abs().mean(dim=1, keepdim=True).clamp(min=1e-5).to(dtype=INT8_PER_ROW_SCALE_DTYPE)
             ternary = torch.round(t / scale).clamp(-1, 1).to(torch.int8)
             packed = pack_ternary(ternary)
             qmeta[name] = {"scheme": "ternary_packed", "shape": list(t.shape)}
@@ -830,7 +823,7 @@ class BitLinear(nn.Module):
         weight_ternary = torch.round(self.weight_latent / scale).clamp(-1, 1)
         w = weight_ternary.detach() - self.weight_latent.detach() + self.weight_latent
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, w * scale, bias)
+        return F.linear(x, (w * scale).to(dtype=x.dtype), bias)
 
 class LowRankFastAdapter(nn.Module):
     def __init__(self, d_in: int, d_out: int, rank: int, key: str):
@@ -1220,10 +1213,12 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if args.eval_window != args.eval_adapt + args.eval_score:
-        raise ValueError("Require EVAL_WINDOW == EVAL_ADAPT + EVAL_SCORE for the first prototype")
     if args.model_dim % args.num_heads != 0:
         raise ValueError("MODEL_DIM must be divisible by NUM_HEADS")
+    if not 1 <= args.num_unique_attn <= args.num_layers:
+        raise ValueError(f"NUM_UNIQUE_ATTN must be in [1, NUM_LAYERS], got {args.num_unique_attn}")
+    if not 1 <= args.num_unique_mlp <= args.num_layers:
+        raise ValueError(f"NUM_UNIQUE_MLP must be in [1, NUM_LAYERS], got {args.num_unique_mlp}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1239,6 +1234,18 @@ def main() -> None:
     if 8 % world_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
     grad_accum_steps = 8 // world_size
+    if args.train_batch_tokens <= 0 or args.train_seq_len <= 0:
+        raise ValueError("TRAIN_BATCH_TOKENS and TRAIN_SEQ_LEN must be positive")
+    if args.train_batch_tokens % (8 * args.train_seq_len) != 0:
+        raise ValueError(
+            f"TRAIN_BATCH_TOKENS={args.train_batch_tokens} must be divisible by 8 * TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
+    local_train_tokens = args.train_batch_tokens // (world_size * grad_accum_steps)
+    if args.use_fast_adapters and args.train_meta_every > 0 and local_train_tokens % (2 * args.train_seq_len) != 0:
+        raise ValueError(
+            "Fast-adapter meta-training requires each local microbatch to split into two equal sequence groups; "
+            f"got local_tokens={local_train_tokens} and TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -1254,10 +1261,14 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
-    enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
-    enable_mem_efficient_sdp(True)
-    enable_math_sdp(True)
+    use_cudnn_sdp = False
+    use_flash_sdp = True
+    use_mem_efficient_sdp = False
+    use_math_sdp = False
+    enable_cudnn_sdp(use_cudnn_sdp)
+    enable_flash_sdp(use_flash_sdp)
+    enable_mem_efficient_sdp(use_mem_efficient_sdp)
+    enable_math_sdp(use_math_sdp)
 
     logfile = None
     if master_process:
@@ -1411,7 +1422,10 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0(
+        f"sdp_backends:cudnn={use_cudnn_sdp} flash={use_flash_sdp} "
+        f"mem_efficient={use_mem_efficient_sdp} math={use_math_sdp}"
+    )
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
@@ -1499,7 +1513,6 @@ def main() -> None:
                 rank,
                 world_size,
                 device,
-                grad_accum_steps,
                 val_tokens,
                 base_bytes_lut,
                 has_leading_space_lut,
@@ -1523,6 +1536,7 @@ def main() -> None:
         progress = step / max(args.iterations, 1)
         meta_active = (
             args.use_fast_adapters
+            and args.train_meta_every > 0
             and args.train_meta_start_frac <= progress < args.train_meta_end_frac
             and (step % args.train_meta_every == 0)
         )
@@ -1540,11 +1554,12 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
 
-                local = train_loader.next_local_span(2 * args.train_seq_len + 1)
-                x_a = local[: args.train_seq_len].unsqueeze(0)
-                y_a = local[1 : args.train_seq_len + 1].unsqueeze(0)
-                x_b = local[args.train_seq_len : 2 * args.train_seq_len].unsqueeze(0)
-                y_b = local[args.train_seq_len + 1 : 2 * args.train_seq_len + 1].unsqueeze(0)
+                pair_tokens = local_train_tokens // 2
+                local = train_loader.next_local_span(local_train_tokens + 1)
+                x_a = local[:pair_tokens].reshape(-1, args.train_seq_len)
+                y_a = local[1 : pair_tokens + 1].reshape(-1, args.train_seq_len)
+                x_b = local[pair_tokens : 2 * pair_tokens].reshape(-1, args.train_seq_len)
+                y_b = local[pair_tokens + 1 : 2 * pair_tokens + 1].reshape(-1, args.train_seq_len)
 
                 zero_state = init_fast_state(
                     args.fast_rank,
@@ -1670,7 +1685,6 @@ def main() -> None:
         rank,
         world_size,
         device,
-        grad_accum_steps,
         val_tokens,
         base_bytes_lut,
         has_leading_space_lut,

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import copy
 import glob
-import io
 import math
 import os
 import random
@@ -47,7 +46,6 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 1337))
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
-    val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
@@ -73,11 +71,11 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 12))
+    num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 1536))
-    num_unique_engines = int(os.environ.get("NUM_UNIQUE_ENGINES", 1))
-    num_heads = int(os.environ.get("NUM_HEADS", 12))
+    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    num_unique_engines = int(os.environ.get("NUM_UNIQUE_ENGINES", 9))
+    num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -470,7 +468,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         stats["baseline_tensor_bytes"] += tensor_nbytes(t)
 
         if name.endswith(".weight_latent"):
-            scale = t.abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
+            scale = t.abs().mean(dim=1, keepdim=True).clamp(min=1e-5).to(dtype=INT8_PER_ROW_SCALE_DTYPE)
             ternary = torch.round(t / scale).clamp(-1, 1).to(torch.int8)
             packed = pack_ternary(ternary)
             qmeta[name] = {"scheme": "ternary_packed", "shape": list(t.shape)}
@@ -820,7 +818,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: Tensor) -> Tensor:
-        return F.rms_norm(x, (self.weight.shape[0],), weight=self.weight, eps=self.eps)
+        return F.rms_norm(x, (self.weight.shape[0],), weight=self.weight.to(dtype=x.dtype), eps=self.eps)
 
 
 class CastedLinear(nn.Linear):
@@ -844,7 +842,7 @@ class BitLinear(nn.Module):
         weight_ternary = torch.round(self.weight_latent / scale).clamp(-1, 1)
         w = weight_ternary.detach() - self.weight_latent.detach() + self.weight_latent
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, w * scale, bias)
+        return F.linear(x, (w * scale).to(dtype=x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -1054,10 +1052,10 @@ class GPT(nn.Module):
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             if getattr(self, "emb_proj", None) is not None:
-                z = F.linear(x, self.emb_proj.weight.t())
-                logits_proj = F.linear(z, self.tok_emb.weight)
+                z = F.linear(x, self.emb_proj.weight.t().to(dtype=x.dtype))
+                logits_proj = F.linear(z, self.tok_emb.weight.to(dtype=x.dtype))
             else:
-                logits_proj = F.linear(x, self.tok_emb.weight)
+                logits_proj = F.linear(x, self.tok_emb.weight.to(dtype=x.dtype))
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
@@ -1117,8 +1115,8 @@ def main() -> None:
 
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(True)
-    enable_math_sdp(True)
+    enable_mem_efficient_sdp(False)
+    enable_math_sdp(False)
 
     logfile = None
     if master_process:
