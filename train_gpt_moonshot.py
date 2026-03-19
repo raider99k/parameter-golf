@@ -105,6 +105,7 @@ class Hyperparameters:
     use_fast_adapters = bool(int(os.environ.get("USE_FAST_ADAPTERS", "0")))
     fast_rank = int(os.environ.get("FAST_RANK", 16))
     fast_grad_clip = float(os.environ.get("FAST_GRAD_CLIP", 0.1))
+    fast_gate_init = float(os.environ.get("FAST_GATE_INIT", 0.05))
 
     # Meta-style training schedule
     train_meta_every = int(os.environ.get("TRAIN_META_EVERY", 2))
@@ -112,6 +113,7 @@ class Hyperparameters:
     train_meta_end_frac = float(os.environ.get("TRAIN_META_END_FRAC", 0.90))
     train_meta_steps = int(os.environ.get("TRAIN_META_STEPS", 1))
     train_meta_first_order = bool(int(os.environ.get("TRAIN_META_FIRST_ORDER", 1)))
+    train_meta_min_seqs_per_side = int(os.environ.get("TRAIN_META_MIN_SEQS_PER_SIDE", 4))
 
     # Streaming eval with causal adaptation
     eval_window = int(os.environ.get("EVAL_WINDOW", 4096))
@@ -191,6 +193,7 @@ class Hyperparameters:
         self.use_fast_adapters = bool(int(os.environ.get("USE_FAST_ADAPTERS", "0")))
         self.fast_rank = int(os.environ.get("FAST_RANK", 16))
         self.fast_grad_clip = float(os.environ.get("FAST_GRAD_CLIP", 0.1))
+        self.fast_gate_init = float(os.environ.get("FAST_GATE_INIT", 0.05))
 
         # Meta-style training schedule
         self.train_meta_every = int(os.environ.get("TRAIN_META_EVERY", 2))
@@ -198,6 +201,7 @@ class Hyperparameters:
         self.train_meta_end_frac = float(os.environ.get("TRAIN_META_END_FRAC", 0.90))
         self.train_meta_steps = int(os.environ.get("TRAIN_META_STEPS", 1))
         self.train_meta_first_order = bool(int(os.environ.get("TRAIN_META_FIRST_ORDER", 1)))
+        self.train_meta_min_seqs_per_side = int(os.environ.get("TRAIN_META_MIN_SEQS_PER_SIDE", 4))
 
         # Streaming eval with causal adaptation
         self.eval_window = int(os.environ.get("EVAL_WINDOW", 4096))
@@ -224,6 +228,7 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "EVAL_TTT_STEPS",
     "EVAL_WINDOW",
     "FAST_GRAD_CLIP",
+    "FAST_GATE_INIT",
     "FAST_RANK",
     "GRAD_CLIP_NORM",
     "HEAD_LR",
@@ -263,6 +268,7 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "TRAIN_META_END_FRAC",
     "TRAIN_META_EVERY",
     "TRAIN_META_FIRST_ORDER",
+    "TRAIN_META_MIN_SEQS_PER_SIDE",
     "TRAIN_META_START_FRAC",
     "TRAIN_META_STEPS",
     "TRAIN_SEQ_LEN",
@@ -1040,13 +1046,13 @@ class BitLinear(nn.Module):
         return F.linear(x, (w * scale).to(dtype=x.dtype), bias)
 
 class LowRankFastAdapter(nn.Module):
-    def __init__(self, d_in: int, d_out: int, rank: int, key: str):
+    def __init__(self, d_in: int, d_out: int, rank: int, key: str, gate_init: float = 0.05):
         super().__init__()
         self.key = key
         self.rank = rank
         self.u_basis = nn.Parameter(torch.empty(d_out, rank))
         self.v_basis = nn.Parameter(torch.empty(rank, d_in))
-        self.gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
+        self.gate = nn.Parameter(torch.tensor(gate_init, dtype=torch.float32))
         self.log_lr = nn.Parameter(torch.tensor(-4.0, dtype=torch.float32))
         self.logit_decay = nn.Parameter(torch.tensor(4.0, dtype=torch.float32))
         self.reset_parameters()
@@ -1121,6 +1127,7 @@ class CausalSelfAttention(nn.Module):
         use_fast_adapter: bool = False,
         fast_rank: int = 16,
         fast_key: str = "",
+        fast_gate_init: float = 0.05,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -1139,7 +1146,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = BitLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.v_fast = (
-            LowRankFastAdapter(dim, kv_dim, fast_rank, fast_key)
+            LowRankFastAdapter(dim, kv_dim, fast_rank, fast_key, gate_init=fast_gate_init)
             if use_fast_adapter else None
         )
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
@@ -1173,14 +1180,22 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int, use_fast_adapter: bool = False, fast_rank: int = 16, fast_key: str = ""):
+    def __init__(
+        self,
+        dim: int,
+        mlp_mult: int,
+        use_fast_adapter: bool = False,
+        fast_rank: int = 16,
+        fast_key: str = "",
+        fast_gate_init: float = 0.05,
+    ):
         super().__init__()
         hidden = mlp_mult * dim
         self.fc = BitLinear(dim, hidden, bias=False)
         self.proj = BitLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
         self.fc_fast = (
-            LowRankFastAdapter(dim, hidden, fast_rank, fast_key)
+            LowRankFastAdapter(dim, hidden, fast_rank, fast_key, gate_init=fast_gate_init)
             if use_fast_adapter else None
         )
 
@@ -1240,6 +1255,7 @@ class GPT(nn.Module):
         num_unique_mlp: int,
         use_fast_adapters: bool,
         fast_rank: int,
+        fast_gate_init: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1268,6 +1284,7 @@ class GPT(nn.Module):
                 use_fast_adapter=use_fast_adapters,
                 fast_rank=fast_rank,
                 fast_key=f"attn_v_{i}",
+                fast_gate_init=fast_gate_init,
             )
             for i in range(num_unique_attn)
         ])
@@ -1278,6 +1295,7 @@ class GPT(nn.Module):
                 use_fast_adapter=use_fast_adapters,
                 fast_rank=fast_rank,
                 fast_key=f"mlp_fc_{i}",
+                fast_gate_init=fast_gate_init,
             )
             for i in range(num_unique_mlp)
         ])
@@ -1299,7 +1317,7 @@ class GPT(nn.Module):
         self.final_norm = RMSNorm(model_dim)
         
         self.out_fast = (
-            LowRankFastAdapter(model_dim, model_dim, fast_rank, "out")
+            LowRankFastAdapter(model_dim, model_dim, fast_rank, "out", gate_init=fast_gate_init)
             if use_fast_adapters else None
         )
 
@@ -1443,6 +1461,12 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError(f"QAT_EVERY_STEPS must be positive, got {args.qat_every_steps}")
     if args.train_meta_steps < 0:
         raise ValueError(f"TRAIN_META_STEPS must be non-negative, got {args.train_meta_steps}")
+    if args.use_fast_adapters and args.fast_gate_init <= 0.0:
+        raise ValueError(f"FAST_GATE_INIT must be positive when fast adapters are enabled, got {args.fast_gate_init}")
+    if args.train_meta_min_seqs_per_side <= 0:
+        raise ValueError(
+            f"TRAIN_META_MIN_SEQS_PER_SIDE must be positive, got {args.train_meta_min_seqs_per_side}"
+        )
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1464,9 +1488,11 @@ def main(argv: list[str] | None = None) -> None:
             f"TRAIN_BATCH_TOKENS={args.train_batch_tokens} must be divisible by 8 * TRAIN_SEQ_LEN={args.train_seq_len}"
         )
     local_train_tokens = args.train_batch_tokens // (world_size * grad_accum_steps)
-    if args.use_fast_adapters and args.train_meta_every > 0 and local_train_tokens % (2 * args.train_seq_len) != 0:
+    meta_pair_tokens = max(local_train_tokens // 2, args.train_meta_min_seqs_per_side * args.train_seq_len)
+    meta_local_tokens = 2 * meta_pair_tokens
+    if args.use_fast_adapters and args.train_meta_every > 0 and local_train_tokens % args.train_seq_len != 0:
         raise ValueError(
-            "Fast-adapter meta-training requires each local microbatch to split into two equal sequence groups; "
+            "Fast-adapter meta-training requires each local microbatch to contain an integral number of sequences; "
             f"got local_tokens={local_train_tokens} and TRAIN_SEQ_LEN={args.train_seq_len}"
         )
     grad_scale = 1.0 / grad_accum_steps
@@ -1569,6 +1595,7 @@ def main(argv: list[str] | None = None) -> None:
         num_unique_mlp=args.num_unique_mlp,
         use_fast_adapters=args.use_fast_adapters,
         fast_rank=args.fast_rank,
+        fast_gate_init=args.fast_gate_init,
     ).to(device=device, dtype=LOW_PRECISION_DTYPE)
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1670,6 +1697,12 @@ def main(argv: list[str] | None = None) -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    if args.use_fast_adapters:
+        log0(
+            f"fast_gate_init:{args.fast_gate_init:.4f} "
+            f"meta_pair_tokens:{meta_pair_tokens} meta_local_tokens:{meta_local_tokens} "
+            f"train_meta_min_seqs_per_side:{args.train_meta_min_seqs_per_side}"
+        )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1794,8 +1827,8 @@ def main(argv: list[str] | None = None) -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
 
-                pair_tokens = local_train_tokens // 2
-                local = train_loader.next_local_span(local_train_tokens + 1)
+                pair_tokens = meta_pair_tokens
+                local = train_loader.next_local_span(meta_local_tokens + 1)
                 x_a = local[:pair_tokens].reshape(-1, args.train_seq_len)
                 y_a = local[1 : pair_tokens + 1].reshape(-1, args.train_seq_len)
                 x_b = local[pair_tokens : 2 * pair_tokens].reshape(-1, args.train_seq_len)
