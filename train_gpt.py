@@ -1201,10 +1201,10 @@ def main(argv: list[str] | None = None) -> None:
     # DISTRIBUTED + CUDA SETUP
     # -----------------------------
 
-    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    distributed = world_size > 1 and "RANK" in os.environ and "WORLD_SIZE" in os.environ
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
     if 8 % world_size != 0:
