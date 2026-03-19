@@ -238,6 +238,42 @@ Conclusion:
 
 - The original tuned optimizer remained the best tested setting.
 
+## Phase 8: 1000-Step Scale Check
+
+The best no-meta Moonshot configuration was then extended from `500` to `1000` steps.
+
+Configuration:
+
+- `NUM_UNIQUE_ATTN=2`
+- `NUM_UNIQUE_MLP=1`
+- `USE_FAST_ADAPTERS=0`
+- `USE_FACTOR_EMBED=1`
+- `EMBED_DIM=96`
+- `TIED_EMBED_LR=0.001`
+- `MATRIX_LR=0.03`
+- `SCALAR_LR=0.04`
+- `GRAD_CLIP_NORM=1.0`
+- `SEED=1337`
+
+Result at `1000` steps:
+
+- `val_loss=5.2241`
+- `val_bpb=2.8297`
+- final int8 roundtrip `val_bpb=2.8290`
+
+Comparison against the same configuration at `500` steps:
+
+| Iterations | `val_bpb` | Final int8 `val_bpb` |
+|---:|---:|---:|
+| `500` | `2.9608` | `2.9614` |
+| `1000` | `2.8297` | `2.8290` |
+
+Conclusion:
+
+- The winning Moonshot backbone continues to improve with longer training.
+- There was no late instability in this `1000`-step run.
+- The int8 roundtrip remained effectively lossless.
+
 ## Current Winning Configuration
 
 This is the current winning Moonshot configuration from the experiments so far:
@@ -259,11 +295,11 @@ USE_FAST_ADAPTERS=0 \
 TRAIN_META_EVERY=0 \
 TRAIN_SEQ_LEN=64 \
 TRAIN_BATCH_TOKENS=1024 \
-ITERATIONS=500 \
+ITERATIONS=1000 \
 WARMUP_STEPS=5 \
 WARMDOWN_ITERS=0 \
 VAL_LOSS_EVERY=0 \
-TRAIN_LOG_EVERY=10 \
+TRAIN_LOG_EVERY=20 \
 MAX_WALLCLOCK_SECONDS=0 \
 VAL_TOKENS_LIMIT=2048 \
 EVAL_ADAPT=128 \
@@ -280,12 +316,13 @@ python train_gpt_moonshot.py
 
 ### Best observed score with this family
 
-- `SEED=3407`
-- `val_loss=5.4447`
-- `val_bpb=2.9493`
-- final int8 roundtrip `val_bpb=2.9504`
+- `SEED=1337`
+- `ITERATIONS=1000`
+- `val_loss=5.2241`
+- `val_bpb=2.8297`
+- final int8 roundtrip `val_bpb=2.8290`
 
-### Multi-seed summary for the winning config
+### Multi-seed summary for the winning config at `500` steps
 
 | Seed | `val_bpb` | Final int8 `val_bpb` |
 |---:|---:|---:|
@@ -309,7 +346,10 @@ Mean `val_bpb`: `2.9960`
 5. The tuned Moonshot quantizes much better than the baseline:
    - baseline final int8 metric degrades noticeably
    - Moonshot final int8 metric is almost unchanged
+6. Longer training is still paying off for the no-meta Moonshot backbone:
+   - `500` steps: `2.9608`
+   - `1000` steps: `2.8297`
 
 ## Suggested Next Step
 
-The next meaningful experiment is not another small hyperparameter nudge. It is a longer run with the winning configuration, for example `ITERATIONS=1000`, to check whether the lead persists and whether the gap over baseline widens or narrows with more training.
+The next meaningful experiment is a matched-horizon baseline comparison, or another `1000`-step Moonshot run on a different seed, to determine how much of the remaining spread is true seed variance versus recoverable with longer training.
