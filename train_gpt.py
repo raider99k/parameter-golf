@@ -642,11 +642,11 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         qmeta_item = qmeta.get(name, {})
         scheme = qmeta_item.get("scheme")
         if scheme == "ternary_packed":
-            scale = obj["scales"][name]
+            scale = obj["scales"][name].to(dtype=torch.float32).view(-1, 1)
             shape = tuple(qmeta_item["shape"])
             ternary = unpack_ternary(q, shape, "cpu")
             sparsity = ternary.float().abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
-            out[name] = (ternary.float() * scale.float() / sparsity).to(LOW_PRECISION_DTYPE).contiguous()
+            out[name] = (ternary.float() * scale / sparsity).to(LOW_PRECISION_DTYPE).contiguous()
             continue
 
         dtype = getattr(torch, obj["dtypes"][name])
