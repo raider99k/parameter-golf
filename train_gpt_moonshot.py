@@ -869,7 +869,8 @@ def unpack_pgq2(data: bytes) -> dict:
             
             qlen, = struct.unpack_from("<I", data, offset)
             offset += 4
-            q = read_tensor(payload_dtype_str, shape, data[offset:offset+qlen])
+            q_shape = (qlen,) if scheme_code == 12 else shape
+            q = read_tensor(payload_dtype_str, q_shape, data[offset:offset+qlen])
             offset += qlen
             
             obj["quantized"][name] = q
