@@ -118,6 +118,7 @@ class Hyperparameters:
     train_meta_loss_a_weight = float(os.environ.get("TRAIN_META_LOSS_A_WEIGHT", 0.2))
     train_meta_loss_b_weight = float(os.environ.get("TRAIN_META_LOSS_B_WEIGHT", 0.8))
     train_meta_adapter_only = bool(int(os.environ.get("TRAIN_META_ADAPTER_ONLY", 1)))
+    train_meta_freeze_backbone = bool(int(os.environ.get("TRAIN_META_FREEZE_BACKBONE", 0)))
 
     # Streaming eval with causal adaptation
     eval_window = int(os.environ.get("EVAL_WINDOW", 4096))
@@ -210,6 +211,7 @@ class Hyperparameters:
         self.train_meta_loss_a_weight = float(os.environ.get("TRAIN_META_LOSS_A_WEIGHT", 0.2))
         self.train_meta_loss_b_weight = float(os.environ.get("TRAIN_META_LOSS_B_WEIGHT", 0.8))
         self.train_meta_adapter_only = bool(int(os.environ.get("TRAIN_META_ADAPTER_ONLY", 1)))
+        self.train_meta_freeze_backbone = bool(int(os.environ.get("TRAIN_META_FREEZE_BACKBONE", 0)))
 
         # Streaming eval with causal adaptation
         self.eval_window = int(os.environ.get("EVAL_WINDOW", 4096))
@@ -280,6 +282,7 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "TRAIN_META_LOSS_A_WEIGHT",
     "TRAIN_META_LOSS_B_WEIGHT",
     "TRAIN_META_ADAPTER_ONLY",
+    "TRAIN_META_FREEZE_BACKBONE",
     "TRAIN_META_MIN_SEQS_PER_SIDE",
     "TRAIN_META_START_FRAC",
     "TRAIN_META_STEPS",
@@ -1423,6 +1426,11 @@ def iter_fast_adapter_params(module: nn.Module) -> list[nn.Parameter]:
             params.append(param)
     return params
 
+def mask_grads_to_param_ids(module: nn.Module, allowed_param_ids: set[int]) -> None:
+    for param in module.parameters():
+        if id(param) not in allowed_param_ids:
+            param.grad = None
+
 def adapt_fast_state(
     model: nn.Module,
     fast_state: dict[str, Tensor],
@@ -1499,6 +1507,8 @@ def main(argv: list[str] | None = None) -> None:
         )
     if args.train_meta_adapter_only and not args.use_fast_adapters:
         raise ValueError("TRAIN_META_ADAPTER_ONLY requires USE_FAST_ADAPTERS=1")
+    if args.train_meta_freeze_backbone and not args.use_fast_adapters:
+        raise ValueError("TRAIN_META_FREEZE_BACKBONE requires USE_FAST_ADAPTERS=1")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1636,6 +1646,7 @@ def main(argv: list[str] | None = None) -> None:
     fast_state_keys = build_fast_state_keys(args.num_unique_attn, args.num_unique_mlp) if args.use_fast_adapters else ()
     fast_adapters = tuple(iter_fast_adapters(base_model)) if args.use_fast_adapters else ()
     fast_adapter_params = tuple(iter_fast_adapter_params(base_model)) if args.use_fast_adapters else ()
+    fast_adapter_param_ids = {id(p) for p in fast_adapter_params}
     zero_fast_state_template = (
         init_fast_state(args.fast_rank, device, fast_state_keys)
         if fast_adapters
@@ -1741,7 +1752,8 @@ def main(argv: list[str] | None = None) -> None:
                 f"train_meta_aux_weight:{args.train_meta_aux_weight:.4f} "
                 f"train_meta_loss_a_weight:{args.train_meta_loss_a_weight:.4f} "
                 f"train_meta_loss_b_weight:{args.train_meta_loss_b_weight:.4f} "
-                f"train_meta_adapter_only:{args.train_meta_adapter_only}"
+                f"train_meta_adapter_only:{args.train_meta_adapter_only} "
+                f"train_meta_freeze_backbone:{args.train_meta_freeze_backbone}"
             )
     log0(f"seed:{args.seed}")
 
@@ -1846,13 +1858,17 @@ def main(argv: list[str] | None = None) -> None:
             break
 
         progress = step / max(args.iterations, 1)
-        meta_active = (
+        meta_phase_active = (
             args.use_fast_adapters
+            and args.train_meta_start_frac <= progress < args.train_meta_end_frac
+        )
+        meta_active = (
+            meta_phase_active
             and args.train_meta_every > 0
             and args.train_meta_steps > 0
-            and args.train_meta_start_frac <= progress < args.train_meta_end_frac
             and (step % args.train_meta_every == 0)
         )
+        freeze_backbone_active = args.train_meta_freeze_backbone and meta_phase_active and bool(fast_adapter_param_ids)
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         qat_active = args.use_projection_qat and (elapsed_ms >= args.qat_start_ms)
@@ -1914,6 +1930,8 @@ def main(argv: list[str] | None = None) -> None:
                                 param.grad.add_(grad)
                     else:
                         (args.train_meta_aux_weight * meta_loss * grad_scale).backward()
+                if freeze_backbone_active:
+                    mask_grads_to_param_ids(base_model, fast_adapter_param_ids)
 
             train_loss /= grad_accum_steps
         else:
@@ -1927,6 +1945,8 @@ def main(argv: list[str] | None = None) -> None:
                     loss = model(x, y)
                 train_loss += loss.detach()
                 (loss * grad_scale).backward()
+                if freeze_backbone_active:
+                    mask_grads_to_param_ids(base_model, fast_adapter_param_ids)
             train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
@@ -1962,7 +1982,9 @@ def main(argv: list[str] | None = None) -> None:
         )
         if should_log_train:
             log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} meta_active:{meta_active} "
+                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"meta_active:{meta_active} meta_phase_active:{meta_phase_active} "
+                f"freeze_backbone_active:{freeze_backbone_active} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
