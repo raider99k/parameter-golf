@@ -44,6 +44,8 @@ class Hyperparameters:
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+    init_model_path = os.environ.get("INIT_MODEL_PATH", "")
+    init_model_strict = bool(int(os.environ.get("INIT_MODEL_STRICT", "1")))
     seed = int(os.environ.get("SEED", 1337))
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
@@ -119,6 +121,7 @@ class Hyperparameters:
     train_meta_loss_b_weight = float(os.environ.get("TRAIN_META_LOSS_B_WEIGHT", 0.8))
     train_meta_adapter_only = bool(int(os.environ.get("TRAIN_META_ADAPTER_ONLY", 1)))
     train_meta_freeze_backbone = bool(int(os.environ.get("TRAIN_META_FREEZE_BACKBONE", 0)))
+    train_meta_same_shard = bool(int(os.environ.get("TRAIN_META_SAME_SHARD", 1)))
 
     # Streaming eval with causal adaptation
     eval_window = int(os.environ.get("EVAL_WINDOW", 4096))
@@ -137,6 +140,8 @@ class Hyperparameters:
         self.val_files = os.path.join(self.data_path, "fineweb_val_*.bin")
         self.tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
         self.run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+        self.init_model_path = os.environ.get("INIT_MODEL_PATH", "")
+        self.init_model_strict = bool(int(os.environ.get("INIT_MODEL_STRICT", "1")))
         self.seed = int(os.environ.get("SEED", 1337))
 
         # Validation cadence and batch size. Validation always uses the full fineweb_val split.
@@ -212,6 +217,7 @@ class Hyperparameters:
         self.train_meta_loss_b_weight = float(os.environ.get("TRAIN_META_LOSS_B_WEIGHT", 0.8))
         self.train_meta_adapter_only = bool(int(os.environ.get("TRAIN_META_ADAPTER_ONLY", 1)))
         self.train_meta_freeze_backbone = bool(int(os.environ.get("TRAIN_META_FREEZE_BACKBONE", 0)))
+        self.train_meta_same_shard = bool(int(os.environ.get("TRAIN_META_SAME_SHARD", 1)))
 
         # Streaming eval with causal adaptation
         self.eval_window = int(os.environ.get("EVAL_WINDOW", 4096))
@@ -243,6 +249,8 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "GRAD_CLIP_NORM",
     "HEAD_LR",
     "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
+    "INIT_MODEL_PATH",
+    "INIT_MODEL_STRICT",
     "ITERATIONS",
     "LOCAL_RANK",
     "LOGIT_SOFTCAP",
@@ -284,6 +292,7 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "TRAIN_META_ADAPTER_ONLY",
     "TRAIN_META_FREEZE_BACKBONE",
     "TRAIN_META_MIN_SEQS_PER_SIDE",
+    "TRAIN_META_SAME_SHARD",
     "TRAIN_META_START_FRAC",
     "TRAIN_META_STEPS",
     "TRAIN_SEQ_LEN",
@@ -997,6 +1006,13 @@ class TokenStream:
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
+    def take_same_file(self, n: int) -> Tensor:
+        while self.tokens.numel() < n or (self.tokens.numel() - self.pos) < n:
+            self._advance_file()
+        chunk = self.tokens[self.pos : self.pos + n]
+        self.pos += n
+        return chunk
+
 
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
@@ -1017,8 +1033,9 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
-    def next_local_span(self, local_tokens_plus_one: int) -> Tensor:
-        chunk = self.stream.take(local_tokens_plus_one * self.world_size)
+    def next_local_span(self, local_tokens_plus_one: int, same_file: bool = False) -> Tensor:
+        take_fn = self.stream.take_same_file if same_file else self.stream.take
+        chunk = take_fn(local_tokens_plus_one * self.world_size)
         start = self.rank * local_tokens_plus_one
         local = chunk[start : start + local_tokens_plus_one].to(dtype=torch.int64)
         return local.to(self.device, non_blocking=True)
@@ -1509,6 +1526,8 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("TRAIN_META_ADAPTER_ONLY requires USE_FAST_ADAPTERS=1")
     if args.train_meta_freeze_backbone and not args.use_fast_adapters:
         raise ValueError("TRAIN_META_FREEZE_BACKBONE requires USE_FAST_ADAPTERS=1")
+    if args.init_model_path and not Path(args.init_model_path).exists():
+        raise FileNotFoundError(f"INIT_MODEL_PATH not found: {args.init_model_path}")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1639,6 +1658,25 @@ def main(argv: list[str] | None = None) -> None:
         fast_rank=args.fast_rank,
         fast_gate_init=args.fast_gate_init,
     ).to(device=device, dtype=LOW_PRECISION_DTYPE)
+    if args.init_model_path:
+        loaded_obj = torch.load(args.init_model_path, map_location="cpu")
+        if isinstance(loaded_obj, dict) and "state_dict" in loaded_obj and isinstance(loaded_obj["state_dict"], dict):
+            init_state = loaded_obj["state_dict"]
+        else:
+            init_state = loaded_obj
+        load_result = base_model.load_state_dict(init_state, strict=args.init_model_strict)
+        if not args.init_model_strict:
+            missing = ", ".join(load_result.missing_keys[:8]) if load_result.missing_keys else ""
+            unexpected = ", ".join(load_result.unexpected_keys[:8]) if load_result.unexpected_keys else ""
+            log0(
+                f"init_model_path:{args.init_model_path} init_model_strict:{args.init_model_strict} "
+                f"missing_keys:{len(load_result.missing_keys)}"
+                + (f" sample_missing:{missing}" if missing else "")
+                + f" unexpected_keys:{len(load_result.unexpected_keys)}"
+                + (f" sample_unexpected:{unexpected}" if unexpected else "")
+            )
+        else:
+            log0(f"init_model_path:{args.init_model_path} init_model_strict:{args.init_model_strict}")
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1745,7 +1783,8 @@ def main(argv: list[str] | None = None) -> None:
         log0(
             f"fast_gate_init:{args.fast_gate_init:.4f} "
             f"meta_pair_tokens:{meta_pair_tokens} meta_local_tokens:{meta_local_tokens} "
-            f"train_meta_min_seqs_per_side:{args.train_meta_min_seqs_per_side}"
+            f"train_meta_min_seqs_per_side:{args.train_meta_min_seqs_per_side} "
+            f"train_meta_same_shard:{args.train_meta_same_shard}"
         )
         if args.train_meta_every > 0 and args.train_meta_steps > 0:
             log0(
@@ -1886,7 +1925,7 @@ def main(argv: list[str] | None = None) -> None:
                 x_main, y_main = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
 
                 pair_tokens = meta_pair_tokens
-                local = train_loader.next_local_span(meta_local_tokens + 1)
+                local = train_loader.next_local_span(meta_local_tokens + 1, same_file=args.train_meta_same_shard)
                 x_a = local[:pair_tokens].reshape(-1, args.train_seq_len)
                 y_a = local[1 : pair_tokens + 1].reshape(-1, args.train_seq_len)
                 x_b = local[pair_tokens : 2 * pair_tokens].reshape(-1, args.train_seq_len)
