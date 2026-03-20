@@ -22,10 +22,11 @@ All results below come from the Colab commands and logs captured in the working 
 ## Important Evaluation Notes
 
 - `train_gpt.py` does not use `EVAL_WINDOW`, `EVAL_ADAPT`, or `EVAL_SCORE`. It uses `EVAL_CTX_LEN` and `EVAL_PRED_LEN` instead.
-- `train_gpt_moonshot.py` parses `EVAL_WINDOW`, but the current implementation does not use it in validation.
+- `train_gpt_moonshot.py` uses `EVAL_WINDOW` only in the documentwise validation path enabled by `EVAL_TTT_DOCUMENTWISE=1`.
 - Moonshot eval-time fast adaptation only runs when both of these are true:
   - `USE_FAST_ADAPTERS=1`
   - `EVAL_TTT_STEPS > 0`
+- `EVAL_TTT_DOCUMENTWISE=1` can be used with `EVAL_TTT_STEPS=0` as a pure scoring-path A/B check.
 - Early comparisons were directionally useful but not perfectly matched until baseline eval was switched to:
   - `EVAL_CTX_LEN=128`
   - `EVAL_PRED_LEN=64`
@@ -348,7 +349,7 @@ These runs held the rest of the meta-replace recipe fixed and only changed the s
 
 Takeaways:
 
-- `TRAIN_META_START_FRAC=0.5` remains the best start point.
+- within this fixed `1000`-step sweep, `TRAIN_META_START_FRAC=0.5` was the best tested start point
 - `TRAIN_META_EVERY=2` and `8` both improved over `4` when `CTX=8`.
 - Increasing the local meta context from `8` to `12` sequences per side gave the strongest single fixed-seed gain.
 
@@ -409,14 +410,44 @@ Interpretation:
 - it loses on the strongest single seed (`3407`)
 - and it also loses on `2024`
 
-Because the mean advantage is tiny and the best single run remains `CTX=8`, `CTX=12` was **not** promoted to the main line.
+Because the mean advantage is tiny and the best single run remained `CTX=8`, `CTX=12` was **not** promoted to the main line at that point.
+
+### Longer-horizon curriculum tests
+
+The next question was whether the `CTX=8, EVERY=4` main line was simply undertrained. Naively extending the old schedule did **not** help:
+
+| Variant | `val_bpb` | Notes |
+|---|---:|---|
+| `1000, START=0.5` | `2.7627` | original best on `SEED=3407` |
+| `1200, START=0.5` | `2.7923` | clearly worse |
+| `1500, START=0.5` | `2.7670` | close, but still worse |
+
+This exposed an important issue: the meta curriculum was controlled by fractions, so longer runs started the meta phase later in absolute training steps.
+
+Follow-up runs shifted the meta start earlier:
+
+| Variant | Seed | `val_bpb` | Final int8 `val_bpb` | Outcome |
+|---|---:|---:|---:|---|
+| `1200, START=0.417` | `3407` | `2.7613` | `2.7619` | slightly better than old `1000 / 0.5` |
+| `1500, START=0.333` | `3407` | `2.7913` | `2.7915` | bad |
+| `1500, START=0.35` | `3407` | `2.7497` | `2.7500` | new best |
+| `1500, START=0.35` | `1337` | `2.7767` | `2.7773` | better than old `1337` |
+| `1500, START=0.35` | `2024` | `2.8165` | `2.8175` | better than old `2024` |
+
+Interpretation:
+
+- the line was **not** saturated
+- longer training only works when the meta curriculum is retimed
+- the improvement is not just "match the old absolute meta start around step 500"
+- `START=0.35` works well for `1500`, while `START=0.333` is clearly worse
+- this makes the curriculum a first-class tuning variable, not just a cosmetic fraction
 
 ## Current Winning Configuration
 
 This remains the current primary Moonshot configuration from the experiments so far:
 
 ```bash
-RUN_ID=moonshot_2x1_fe96_meta_replace_ctx8_1000 \
+RUN_ID=moonshot_2x1_fe96_meta_replace_ctx8_1500_start035 \
 DATA_PATH=./data/datasets/fineweb10B_sp1024 \
 TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
 SEED=3407 \
@@ -434,7 +465,7 @@ FAST_GRAD_CLIP=0.1 \
 FAST_GATE_INIT=0.05 \
 TRAIN_META_MODE=replace \
 TRAIN_META_EVERY=4 \
-TRAIN_META_START_FRAC=0.5 \
+TRAIN_META_START_FRAC=0.35 \
 TRAIN_META_END_FRAC=1.0 \
 TRAIN_META_STEPS=1 \
 TRAIN_META_FIRST_ORDER=1 \
@@ -446,11 +477,11 @@ TRAIN_META_FREEZE_BACKBONE=0 \
 TRAIN_META_SAME_SHARD=0 \
 TRAIN_SEQ_LEN=64 \
 TRAIN_BATCH_TOKENS=1024 \
-ITERATIONS=1000 \
+ITERATIONS=1500 \
 WARMUP_STEPS=5 \
 WARMDOWN_ITERS=0 \
 VAL_LOSS_EVERY=0 \
-TRAIN_LOG_EVERY=10 \
+TRAIN_LOG_EVERY=20 \
 MAX_WALLCLOCK_SECONDS=0 \
 VAL_TOKENS_LIMIT=2048 \
 EVAL_ADAPT=256 \
@@ -469,26 +500,28 @@ python train_gpt_moonshot.py
 ### Best observed score with this family
 
 - `SEED=3407`
-- `ITERATIONS=1000`
-- `val_loss=5.1003`
-- `val_bpb=2.7627`
-- final int8 roundtrip `val_bpb=2.7633`
+- `ITERATIONS=1500`
+- `TRAIN_META_START_FRAC=0.35`
+- `val_loss=5.0764`
+- `val_bpb=2.7497`
+- final int8 roundtrip `val_bpb=2.7500`
 
-### Multi-seed summary for the winning config at `1000` steps
+### Multi-seed summary for the winning config at `1500` steps
 
 | Seed | `val_bpb` | Final int8 `val_bpb` |
 |---:|---:|---:|
-| `1337` | `2.8012` | `2.8020` |
-| `2024` | `2.8217` | `2.8229` |
-| `3407` | `2.7627` | `2.7633` |
+| `1337` | `2.7767` | `2.7773` |
+| `2024` | `2.8165` | `2.8175` |
+| `3407` | `2.7497` | `2.7500` |
 
-Mean `val_bpb`: `2.7952`
+Mean `val_bpb`: `2.7810`
 
 Why this remains the main line:
 
-- it still owns the best single observed run
-- the `CTX=12` follow-up did not beat it on `SEED=3407`
-- the `CTX=12` mean advantage was too small and too seed-dependent to justify switching
+- it improves all three tested seeds versus the old `1000 / START=0.5` line
+- it owns the new best single observed run
+- it improves the three-seed mean from `2.7952` to `2.7810`
+- the later document-episodic meta path was conceptually cleaner, but it did not beat this line on mean or on best single-seed score
 
 ## Main Conclusions
 
@@ -500,22 +533,34 @@ Why this remains the main line:
 3. The most reliable sharing pattern so far is:
    - unique attention
    - shared MLP
-4. Eval-time TTT has still not shown measurable value in the tested regime.
+4. Eval-time TTT has still not shown measurable value in the tested regime:
+   - legacy blockwise eval TTT did not help
+   - documentwise eval TTT also did not help
+   - persistence across documents did not help
 5. The tuned Moonshot quantizes much better than the baseline:
    - baseline final int8 metric degrades noticeably
    - Moonshot final int8 metric is almost unchanged
-6. The current best result comes from replace-style meta as a training objective:
+6. The current best result still comes from replace-style meta as a training objective, but with a retimed longer-horizon curriculum:
    - no-meta `1000` steps, `SEED=1337`: `2.8297`
-   - meta-replace `1000` steps, `SEED=1337`: `2.8012`
-   - meta-replace `1000` steps, `SEED=3407`: `2.7627`
+   - old meta-replace `1000 / START=0.5`, `SEED=3407`: `2.7627`
+   - new meta-replace `1500 / START=0.35`, `SEED=3407`: `2.7497`
 7. The meta gain does not appear to come from runtime adaptation:
    - stage-2 frozen-backbone meta did not improve a pretrained backbone
    - `EVAL_TTT_STEPS` did not improve validation
+   - the aligned documentwise eval path also produced identical metrics with and without TTT
    - the benefit comes from how the replace-style meta objective shapes full training
+8. The `meta-replace` line was not saturated; the issue was curriculum timing:
+   - naive `1200` and `1500` runs with `START=0.5` did not improve
+   - retiming the meta start to `0.35` at `1500` steps improved all three seeds
+   - `START=0.333` performed badly, so the good region is narrow
+9. The document-episodic meta branch is closer to the original meta-learning vision, but it is not the strongest competition path on T4:
+   - it wins on some seeds
+   - it loses on mean
+   - it increases complexity without producing useful eval-time adaptation
 
 ## New Moonshot Meta Path
 
-A new Moonshot-only meta-training path has been implemented in `train_gpt_moonshot.py` to better match the original meta-learning goal.
+A new Moonshot-only meta-training path was implemented in `train_gpt_moonshot.py` to better match the original meta-learning goal.
 
 What it does:
 
@@ -532,22 +577,72 @@ New controls:
 - `TRAIN_META_QUERY_TOKENS`
 - `TRAIN_META_DOC_BOS_ID`
 
+Additional eval controls added later:
+
+- `EVAL_TTT_DOCUMENTWISE=1`
+- `EVAL_TTT_DOC_BOS_ID`
+- `EVAL_TTT_PERSIST_ACROSS_DOCS`
+
+### `1000`-step document-episodic training results
+
+These runs used document-bounded support/query episodes during training and kept `EVAL_TTT_STEPS=0`.
+
+| Seed | Main line `CTX=8, EVERY=4` | Doc-meta | Outcome |
+|---:|---:|---:|---|
+| `1337` | `2.8012` | `2.7928` | doc-meta better |
+| `2024` | `2.8217` | `2.8497` | doc-meta worse |
+| `3407` | `2.7627` | `2.7676` | doc-meta slightly worse |
+
+Means:
+
+- main line `CTX=8, EVERY=4`: `2.7952`
+- document-episodic meta: `2.8034`
+
 Interpretation:
 
-- this is much closer to the intended meta-learning setup than the original flat-stream replace objective
-- it is still a Moonshot training-path change, not yet a validated new winner
-- no leaderboard-quality benchmark has been recorded for this mode yet in the experiment log
+- this branch is much closer to the intended meta-learning setup than the original flat-stream replace objective
+- it produced one real seed win
+- but it lost on mean and did not beat the best single observed score
+- it was therefore not promoted over the existing `meta-replace` main line
+
+### Documentwise eval-time TTT checks
+
+The training-side doc-meta branch was then paired with a BOS-aware documentwise eval path to test whether aligned eval-time adaptation finally mattered.
+
+Small validation slice, `VAL_TOKENS_LIMIT=2048`, `SEED=3407`:
+
+- docwise eval + `EVAL_TTT_STEPS=1`, reset per doc: `2.7676`
+- docwise eval + `EVAL_TTT_STEPS=1`, persist across docs: `2.7676`
+
+This already suggested no measurable effect from eval-time TTT or persistence.
+
+Matched controls on a larger validation slice, `VAL_TOKENS_LIMIT=32768`, `SEED=3407`:
+
+| Eval mode | `val_bpb` | Final int8 `val_bpb` | Eval time | Observation |
+|---|---:|---:|---:|---|
+| base eval, no TTT | `3.0134` | `3.0140` | `3509ms` | reference |
+| documentwise eval, no TTT | `3.0134` | `3.0140` | `9397ms` | same metric, slower |
+| documentwise eval, TTT reset per doc | `3.0134` | `3.0140` | `24504ms` | same metric, much slower |
+| documentwise eval, TTT persist across docs | `3.0134` | `3.0140` | `24642ms` | same metric, much slower |
+
+Interpretation:
+
+- the documentwise scorer itself did not change the metric
+- eval-time TTT remained completely inert in these matched tests
+- carrying fast state across documents also remained inert
+- on T4, the eval path mainly increased runtime and memory without improving validation
 
 Status:
 
-- implemented locally in `train_gpt_moonshot.py`
-- compiles successfully
-- still needs real GPU experiments before promotion into the main configuration
+- the code path is implemented and compile-clean
+- it is useful as a research branch because it matches the intended meta-learning story more closely
+- it is not the competition main line
+- the current practical conclusion is to keep `meta-replace` as the primary Moonshot recipe and deprioritize eval-time TTT on T4
 
 ## Recommended Next Step
 
-After completing the schedule sweep and the `CTX=12` follow-up, the next meaningful experiments are:
+After the long-horizon curriculum sweep, the new `meta-replace 1500 / START=0.35` recipe should be treated as the default Moonshot line:
 
-1. More seed checks on the `CTX=8, EVERY=4` main line if the goal is leaderboard robustness.
-2. A longer horizon on the best single-seed recipe (`SEED=3407`, `CTX=8`, `EVERY=4`) if wallclock budget allows.
-3. No further short-run tuning on `FAST_RANK` or the `loss_a/loss_b` split unless a new structural idea changes the meta objective itself.
+1. Use `ITERATIONS=1500` and `TRAIN_META_START_FRAC=0.35` as the new default main-line schedule.
+2. If more T4 tuning is done, keep it narrow around the winning curriculum rather than reopening the eval-TTT or doc-meta branches.
+3. Put any larger remaining effort into scaling the backbone on stronger hardware, not into further documentwise eval-TTT work on T4.
