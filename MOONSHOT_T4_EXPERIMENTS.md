@@ -274,15 +274,74 @@ Conclusion:
 - There was no late instability in this `1000`-step run.
 - The int8 roundtrip remained effectively lossless.
 
+## Phase 9: Meta Investigation and Reproduction
+
+Meta was revisited because two early hypotheses looked plausible:
+
+1. the fast adapters were dead at initialization due to `gate=0`
+2. the support/query split was too small to define a useful adaptation task
+
+### Fixes added to the script
+
+- `FAST_GATE_INIT` was introduced so fast adapters no longer start fully closed
+- `TRAIN_META_MIN_SEQS_PER_SIDE` was introduced so support/query spans could be larger than a single `64`-token sequence
+- later, `TRAIN_META_MODE=replace|aux` was added so the legacy meta objective could be reproduced explicitly
+
+### What did not work
+
+- eval-time TTT still showed no measurable benefit in direct A/B tests
+- stage-2 adapter-only meta on top of a pretrained backbone also showed no gain
+- auxiliary meta loss and late-phase backbone freezing reduced collapse, but they did not beat the legacy from-scratch meta path
+
+### What did work
+
+The legacy replace-style meta objective turned out to be real and reproducible.
+
+Configuration:
+
+- `USE_FAST_ADAPTERS=1`
+- `FAST_RANK=2`
+- `FAST_GRAD_CLIP=0.1`
+- `FAST_GATE_INIT=0.05`
+- `TRAIN_META_MODE=replace`
+- `TRAIN_META_EVERY=4`
+- `TRAIN_META_START_FRAC=0.5`
+- `TRAIN_META_END_FRAC=1.0`
+- `TRAIN_META_STEPS=1`
+- `TRAIN_META_FIRST_ORDER=1`
+- `TRAIN_META_MIN_SEQS_PER_SIDE=8`
+- `TRAIN_META_LOSS_A_WEIGHT=0.2`
+- `TRAIN_META_LOSS_B_WEIGHT=0.8`
+- `TRAIN_META_ADAPTER_ONLY=0`
+- `TRAIN_META_FREEZE_BACKBONE=0`
+- `TRAIN_META_SAME_SHARD=0`
+- `EVAL_TTT_STEPS=0`
+
+### `1000`-step meta-replace results
+
+| Seed | `val_bpb` | Final int8 `val_bpb` |
+|---:|---:|---:|
+| `1337` | `2.8012` | `2.8020` |
+| `2024` | `2.8217` | `2.8229` |
+| `3407` | `2.7627` | `2.7633` |
+
+Mean `val_bpb`: `2.7952`
+
+Conclusion:
+
+- Meta remains non-useful as test-time adaptation.
+- But the legacy replace-style meta objective improves training enough to beat the no-meta backbone.
+- The gain appears to come from the training trajectory, not from runtime TTT.
+
 ## Current Winning Configuration
 
 This is the current winning Moonshot configuration from the experiments so far:
 
 ```bash
-RUN_ID=moonshot_2x1_fe96_best \
+RUN_ID=moonshot_2x1_fe96_meta_replace_ctx8_1000 \
 DATA_PATH=./data/datasets/fineweb10B_sp1024 \
 TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
-SEED=1337 \
+SEED=3407 \
 VOCAB_SIZE=1024 \
 NUM_LAYERS=2 \
 NUM_UNIQUE_ATTN=2 \
@@ -291,19 +350,34 @@ MODEL_DIM=128 \
 NUM_HEADS=4 \
 NUM_KV_HEADS=2 \
 MLP_MULT=2 \
-USE_FAST_ADAPTERS=0 \
-TRAIN_META_EVERY=0 \
+USE_FAST_ADAPTERS=1 \
+FAST_RANK=2 \
+FAST_GRAD_CLIP=0.1 \
+FAST_GATE_INIT=0.05 \
+TRAIN_META_MODE=replace \
+TRAIN_META_EVERY=4 \
+TRAIN_META_START_FRAC=0.5 \
+TRAIN_META_END_FRAC=1.0 \
+TRAIN_META_STEPS=1 \
+TRAIN_META_FIRST_ORDER=1 \
+TRAIN_META_MIN_SEQS_PER_SIDE=8 \
+TRAIN_META_LOSS_A_WEIGHT=0.2 \
+TRAIN_META_LOSS_B_WEIGHT=0.8 \
+TRAIN_META_ADAPTER_ONLY=0 \
+TRAIN_META_FREEZE_BACKBONE=0 \
+TRAIN_META_SAME_SHARD=0 \
 TRAIN_SEQ_LEN=64 \
 TRAIN_BATCH_TOKENS=1024 \
 ITERATIONS=1000 \
 WARMUP_STEPS=5 \
 WARMDOWN_ITERS=0 \
 VAL_LOSS_EVERY=0 \
-TRAIN_LOG_EVERY=20 \
+TRAIN_LOG_EVERY=10 \
 MAX_WALLCLOCK_SECONDS=0 \
 VAL_TOKENS_LIMIT=2048 \
-EVAL_ADAPT=128 \
+EVAL_ADAPT=256 \
 EVAL_SCORE=64 \
+EVAL_TTT_STEPS=0 \
 USE_FACTOR_EMBED=1 \
 EMBED_DIM=96 \
 TIED_EMBED_LR=0.001 \
@@ -316,21 +390,21 @@ python train_gpt_moonshot.py
 
 ### Best observed score with this family
 
-- `SEED=1337`
+- `SEED=3407`
 - `ITERATIONS=1000`
-- `val_loss=5.2241`
-- `val_bpb=2.8297`
-- final int8 roundtrip `val_bpb=2.8290`
+- `val_loss=5.1003`
+- `val_bpb=2.7627`
+- final int8 roundtrip `val_bpb=2.7633`
 
-### Multi-seed summary for the winning config at `500` steps
+### Multi-seed summary for the winning config at `1000` steps
 
 | Seed | `val_bpb` | Final int8 `val_bpb` |
 |---:|---:|---:|
-| `1337` | `2.9608` | `2.9614` |
-| `2024` | `3.0778` | `3.0797` |
-| `3407` | `2.9493` | `2.9504` |
+| `1337` | `2.8012` | `2.8020` |
+| `2024` | `2.8217` | `2.8229` |
+| `3407` | `2.7627` | `2.7633` |
 
-Mean `val_bpb`: `2.9960`
+Mean `val_bpb`: `2.7952`
 
 ## Main Conclusions
 
@@ -342,14 +416,25 @@ Mean `val_bpb`: `2.9960`
 3. The most reliable sharing pattern so far is:
    - unique attention
    - shared MLP
-4. Fast adapters and meta training have not helped in the tested regime.
+4. Eval-time TTT has still not shown measurable value in the tested regime.
 5. The tuned Moonshot quantizes much better than the baseline:
    - baseline final int8 metric degrades noticeably
    - Moonshot final int8 metric is almost unchanged
-6. Longer training is still paying off for the no-meta Moonshot backbone:
-   - `500` steps: `2.9608`
-   - `1000` steps: `2.8297`
+6. The current best result comes from replace-style meta as a training objective:
+   - no-meta `1000` steps, `SEED=1337`: `2.8297`
+   - meta-replace `1000` steps, `SEED=1337`: `2.8012`
+   - meta-replace `1000` steps, `SEED=3407`: `2.7627`
+7. The meta gain does not appear to come from runtime adaptation:
+   - stage-2 frozen-backbone meta did not improve a pretrained backbone
+   - `EVAL_TTT_STEPS` did not improve validation
+   - the benefit comes from how the replace-style meta objective shapes full training
 
 ## Suggested Next Step
 
-The next meaningful experiment is a matched-horizon baseline comparison, or another `1000`-step Moonshot run on a different seed, to determine how much of the remaining spread is true seed variance versus recoverable with longer training.
+The next meaningful experiments are small schedule sweeps on the winning meta-replace line:
+
+1. `TRAIN_META_START_FRAC=0.4`
+2. `TRAIN_META_START_FRAC=0.6`
+3. `TRAIN_META_EVERY=2`
+4. `TRAIN_META_EVERY=8`
+5. `TRAIN_META_MIN_SEQS_PER_SIDE=12`
