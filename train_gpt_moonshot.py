@@ -134,6 +134,9 @@ class Hyperparameters:
     eval_adapt = int(os.environ.get("EVAL_ADAPT", 3072))
     eval_score = int(os.environ.get("EVAL_SCORE", 1024))
     eval_ttt_steps = int(os.environ.get("EVAL_TTT_STEPS", 0))
+    eval_ttt_documentwise = bool(int(os.environ.get("EVAL_TTT_DOCUMENTWISE", 0)))
+    eval_ttt_doc_bos_id = int(os.environ.get("EVAL_TTT_DOC_BOS_ID", 1))
+    eval_ttt_persist_across_docs = bool(int(os.environ.get("EVAL_TTT_PERSIST_ACROSS_DOCS", 0)))
 
     # Compile behavior
     use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
@@ -236,6 +239,9 @@ class Hyperparameters:
         self.eval_adapt = int(os.environ.get("EVAL_ADAPT", 3072))
         self.eval_score = int(os.environ.get("EVAL_SCORE", 1024))
         self.eval_ttt_steps = int(os.environ.get("EVAL_TTT_STEPS", 0))
+        self.eval_ttt_documentwise = bool(int(os.environ.get("EVAL_TTT_DOCUMENTWISE", 0)))
+        self.eval_ttt_doc_bos_id = int(os.environ.get("EVAL_TTT_DOC_BOS_ID", 1))
+        self.eval_ttt_persist_across_docs = bool(int(os.environ.get("EVAL_TTT_PERSIST_ACROSS_DOCS", 0)))
 
         # Compile behavior
         self.use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
@@ -254,6 +260,9 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "EVAL_ADAPT",
     "EVAL_SCORE",
     "EVAL_TTT_STEPS",
+    "EVAL_TTT_DOCUMENTWISE",
+    "EVAL_TTT_DOC_BOS_ID",
+    "EVAL_TTT_PERSIST_ACROSS_DOCS",
     "EVAL_WINDOW",
     "FAST_GRAD_CLIP",
     "FAST_GATE_INIT",
@@ -518,6 +527,21 @@ def eval_val(
     fast_state_keys: tuple[str, ...] = (),
     adapters: tuple[LowRankFastAdapter, ...] = (),
 ) -> tuple[float, float]:
+    if args.eval_ttt_documentwise:
+        return eval_val_documentwise(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            fast_state_keys=fast_state_keys,
+            adapters=adapters,
+        )
+
     total_targets = val_tokens.numel() - 1
     num_blocks = math.ceil(total_targets / args.eval_score)
 
@@ -575,6 +599,117 @@ def eval_val(
         token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
         token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
         val_byte_count += token_bytes.to(torch.float64).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_documentwise(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    fast_state_keys: tuple[str, ...] = (),
+    adapters: tuple[LowRankFastAdapter, ...] = (),
+) -> tuple[float, float]:
+    docs = find_documents_by_bos(val_tokens, args.eval_ttt_doc_bos_id)
+    if not docs:
+        raise ValueError("Documentwise eval requested, but no BOS-delimited documents were found")
+
+    doc_start = (len(docs) * rank) // world_size
+    doc_end = (len(docs) * (rank + 1)) // world_size
+    rank_docs = docs[doc_start:doc_end]
+
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model.eval()
+    use_fast_eval = args.eval_ttt_steps > 0 and bool(adapters)
+    eval_window = max(args.eval_window, args.eval_score)
+    shared_fast_state = (
+        init_fast_state(args.fast_rank, device, fast_state_keys)
+        if use_fast_eval and args.eval_ttt_persist_across_docs
+        else None
+    )
+
+    for doc_offset, doc_len in rank_docs:
+        pred_len = doc_len - 1
+        num_blocks = math.ceil(pred_len / args.eval_score)
+        fast_state = shared_fast_state if shared_fast_state is not None else (
+            init_fast_state(args.fast_rank, device, fast_state_keys) if use_fast_eval else None
+        )
+
+        for block_id in range(num_blocks):
+            score_start = block_id * args.eval_score
+            score_end = min(score_start + args.eval_score, pred_len)
+            window_start = max(0, score_end - eval_window)
+            window_end = score_end
+
+            local = val_tokens[doc_offset + window_start : doc_offset + window_end + 1].to(
+                device=device,
+                dtype=torch.int64,
+                non_blocking=True,
+            )
+            x_full = local[:-1].unsqueeze(0)
+            y_full = local[1:].unsqueeze(0)
+
+            score_offset = score_start - window_start
+            score_len = score_end - score_start
+
+            if use_fast_eval:
+                prefix_start = max(0, score_start - args.eval_adapt)
+                adapt_start = max(window_start, prefix_start)
+                adapt_len = score_start - adapt_start
+                if adapt_len > 0:
+                    adapt_offset = adapt_start - window_start
+                    adapt_mask = torch.zeros_like(y_full, dtype=torch.float32)
+                    adapt_mask[:, adapt_offset : adapt_offset + adapt_len] = 1.0
+                    fast_state = adapt_fast_state(
+                        model,
+                        fast_state if fast_state is not None else init_fast_state(args.fast_rank, device, fast_state_keys),
+                        x_full,
+                        y_full,
+                        steps=args.eval_ttt_steps,
+                        clip=args.fast_grad_clip,
+                        create_graph=False,
+                        detach_result=True,
+                        adapters=adapters,
+                        loss_mask=adapt_mask,
+                    )
+
+            score_mask = torch.zeros_like(y_full, dtype=torch.float32)
+            score_mask[:, score_offset : score_offset + score_len] = 1.0
+
+            with torch.no_grad():
+                with torch.autocast(device_type="cuda", dtype=LOW_PRECISION_DTYPE, enabled=True):
+                    batch_loss = model(x_full, y_full, fast_state=fast_state, loss_mask=score_mask)
+
+            batch_token_count = float(score_len)
+            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
+            val_token_count += batch_token_count
+
+            prev_ids = x_full.reshape(-1)[score_offset : score_offset + score_len]
+            tgt_ids = y_full.reshape(-1)[score_offset : score_offset + score_len]
+            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+            val_byte_count += token_bytes.to(torch.float64).sum()
+
+        if shared_fast_state is not None:
+            shared_fast_state = fast_state
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
@@ -1565,6 +1700,7 @@ def adapt_fast_state(
     create_graph: bool = False,
     detach_result: bool | None = None,
     adapters: tuple[LowRankFastAdapter, ...] | None = None,
+    loss_mask: Tensor | None = None,
 ) -> dict[str, Tensor]:
     adapters = tuple(iter_fast_adapters(model) if adapters is None else adapters)
     state = {k: v.clone().detach().requires_grad_(True) for k, v in fast_state.items()}
@@ -1578,7 +1714,7 @@ def adapt_fast_state(
         # Recompute the prefix loss from the exact state being adapted.
         # Cached outer losses are often detached from this internal clone,
         # which would make autograd.grad see an unused tensor.
-        loss = model(x_prefix, y_prefix, fast_state=state)
+        loss = model(x_prefix, y_prefix, fast_state=state, loss_mask=loss_mask)
         grads = torch.autograd.grad(
             loss,
             [state[a.key] for a in active_adapters],
@@ -1638,11 +1774,17 @@ def main(argv: list[str] | None = None) -> None:
             "TRAIN_META_ADAPT_TOKENS and TRAIN_META_QUERY_TOKENS must be positive, "
             f"got {args.train_meta_adapt_tokens} and {args.train_meta_query_tokens}"
         )
+    if args.eval_window <= 0 or args.eval_score <= 0:
+        raise ValueError(f"EVAL_WINDOW and EVAL_SCORE must be positive, got {args.eval_window} and {args.eval_score}")
+    if args.eval_adapt < 0 or args.eval_ttt_steps < 0:
+        raise ValueError(f"EVAL_ADAPT and EVAL_TTT_STEPS must be non-negative, got {args.eval_adapt} and {args.eval_ttt_steps}")
     meta_training_configured = args.train_meta_every > 0 and args.train_meta_steps > 0
     if args.train_meta_adapter_only and meta_training_configured and not args.use_fast_adapters:
         raise ValueError("TRAIN_META_ADAPTER_ONLY requires USE_FAST_ADAPTERS=1")
     if args.train_meta_freeze_backbone and meta_training_configured and not args.use_fast_adapters:
         raise ValueError("TRAIN_META_FREEZE_BACKBONE requires USE_FAST_ADAPTERS=1")
+    if args.eval_ttt_persist_across_docs and not args.eval_ttt_documentwise:
+        raise ValueError("EVAL_TTT_PERSIST_ACROSS_DOCS requires EVAL_TTT_DOCUMENTWISE=1")
     if args.init_model_path and not Path(args.init_model_path).exists():
         raise FileNotFoundError(f"INIT_MODEL_PATH not found: {args.init_model_path}")
 
@@ -1916,6 +2058,13 @@ def main(argv: list[str] | None = None) -> None:
                     f"train_meta_query_tokens:{args.train_meta_query_tokens} "
                     f"train_meta_doc_bos_id:{args.train_meta_doc_bos_id}"
                 )
+    if args.eval_ttt_documentwise:
+        log0(
+            f"eval_ttt_documentwise:True "
+            f"eval_ttt_doc_bos_id:{args.eval_ttt_doc_bos_id} "
+            f"eval_ttt_persist_across_docs:{args.eval_ttt_persist_across_docs} "
+            f"eval_window:{args.eval_window} eval_adapt:{args.eval_adapt} eval_score:{args.eval_score}"
+        )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
