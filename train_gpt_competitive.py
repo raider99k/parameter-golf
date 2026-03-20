@@ -2030,8 +2030,6 @@ def main(argv: list[str] | None = None) -> None:
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
-        fast_state_keys=fast_state_keys,
-        adapters=fast_adapters,
     )
     torch.cuda.synchronize()
     log0(
