@@ -67,6 +67,7 @@ class Hyperparameters:
     qat_start_ms = float(os.environ.get("QAT_START_MS", 540000.0))
     qat_lr_scale = float(os.environ.get("QAT_LR_SCALE", 0.25))
     qat_every_steps = int(os.environ.get("QAT_EVERY_STEPS", 4))
+    qat_include_small_floats = bool(int(os.environ.get("QAT_INCLUDE_SMALL_FLOATS", "0")))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -139,6 +140,12 @@ class Hyperparameters:
     use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
     compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "0")))
 
+    # Compression-aware training hooks
+    compression_reg_weight = float(os.environ.get("COMPRESSION_REG_WEIGHT", 0.0))
+    compression_reg_start_frac = float(os.environ.get("COMPRESSION_REG_START_FRAC", 0.0))
+    compression_reg_every_steps = int(os.environ.get("COMPRESSION_REG_EVERY_STEPS", 1))
+    compression_reg_include_small_floats = bool(int(os.environ.get("COMPRESSION_REG_INCLUDE_SMALL_FLOATS", "0")))
+
     def __init__(self):
         # Data paths are shard globs produced by the existing preprocessing pipeline.
         self.data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -159,6 +166,7 @@ class Hyperparameters:
         self.qat_start_ms = float(os.environ.get("QAT_START_MS", 540000.0))
         self.qat_lr_scale = float(os.environ.get("QAT_LR_SCALE", 0.25))
         self.qat_every_steps = int(os.environ.get("QAT_EVERY_STEPS", 4))
+        self.qat_include_small_floats = bool(int(os.environ.get("QAT_INCLUDE_SMALL_FLOATS", "0")))
 
         # Training length.
         self.iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -229,12 +237,23 @@ class Hyperparameters:
         self.use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
         self.compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "0")))
 
+        # Compression-aware training hooks
+        self.compression_reg_weight = float(os.environ.get("COMPRESSION_REG_WEIGHT", 0.0))
+        self.compression_reg_start_frac = float(os.environ.get("COMPRESSION_REG_START_FRAC", 0.0))
+        self.compression_reg_every_steps = int(os.environ.get("COMPRESSION_REG_EVERY_STEPS", 1))
+        self.compression_reg_include_small_floats = bool(int(os.environ.get("COMPRESSION_REG_INCLUDE_SMALL_FLOATS", "0")))
+
 
 CLI_OVERRIDE_ENV_KEYS = frozenset({
     "ADAM_EPS",
     "BETA1",
     "BETA2",
+    "BITLINEAR_GROUP_SIZE",
     "COMPILE_FULLGRAPH",
+    "COMPRESSION_REG_EVERY_STEPS",
+    "COMPRESSION_REG_INCLUDE_SMALL_FLOATS",
+    "COMPRESSION_REG_START_FRAC",
+    "COMPRESSION_REG_WEIGHT",
     "CONTROL_TENSOR_NAME_PATTERNS",
     "DATA_PATH",
     "EMBED_DIM",
@@ -246,6 +265,9 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "FAST_RANK",
     "GRAD_CLIP_NORM",
     "HEAD_LR",
+    "INT8_FORCE_QUANTIZE_NAME_PATTERNS",
+    "INT8_KEEP_FLOAT_MAX_NUMEL",
+    "INT8_KEEP_FLOAT_NAME_PATTERNS",
     "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
     "INIT_MODEL_PATH",
     "INIT_MODEL_STRICT",
@@ -267,6 +289,7 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "NUM_UNIQUE_ENGINES",
     "NUM_UNIQUE_MLP",
     "QAT_EVERY_STEPS",
+    "QAT_INCLUDE_SMALL_FLOATS",
     "QAT_LR_SCALE",
     "QAT_START_MS",
     "QK_GAIN_INIT",
@@ -564,6 +587,11 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
+INT8_KEEP_FLOAT_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("INT8_KEEP_FLOAT_NAME_PATTERNS", "").split(",")
+    if pattern
+)
 INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
@@ -572,11 +600,17 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
-INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+INT8_FORCE_QUANTIZE_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get("INT8_FORCE_QUANTIZE_NAME_PATTERNS", "").split(",")
+    if pattern
+)
+INT8_KEEP_FLOAT_MAX_NUMEL = int(os.environ.get("INT8_KEEP_FLOAT_MAX_NUMEL", 65_536))
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+BITLINEAR_GROUP_SIZE = int(os.environ.get("BITLINEAR_GROUP_SIZE", "0"))
 
 def build_fast_state_keys(num_unique_attn: int, num_unique_mlp: int) -> tuple[str, ...]:
     keys = [f"attn_v_{i}" for i in range(num_unique_attn)]
@@ -586,24 +620,45 @@ def build_fast_state_keys(num_unique_attn: int, num_unique_mlp: int) -> tuple[st
 
 FAST_STATE_KEYS = build_fast_state_keys(3, 3)
 
-def get_export_project_params(model: nn.Module) -> tuple[tuple[str, Tensor], ...]:
-    cached = getattr(model, "_export_project_params", None)
+def get_export_project_params(model: nn.Module, include_small: bool = False) -> tuple[tuple[str, Tensor], ...]:
+    cache_attr = "_export_project_params_all" if include_small else "_export_project_params"
+    cached = getattr(model, cache_attr, None)
     if cached is None:
         cached = tuple(
             (name, p)
             for name, p in model.named_parameters()
-            if p.is_floating_point()
-            and p.numel() > INT8_KEEP_FLOAT_MAX_NUMEL
-            and not any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS)
+            if should_quantize_float_tensor(name, p, include_small=include_small)
         )
-        setattr(model, "_export_project_params", cached)
+        setattr(model, cache_attr, cached)
     return cached
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
+def name_matches_any(name: str, patterns: tuple[str, ...]) -> bool:
+    return any(pattern in name for pattern in patterns)
+
+def should_force_quantize_tensor(name: str) -> bool:
+    return name_matches_any(name, INT8_FORCE_QUANTIZE_NAME_PATTERNS)
+
+def should_keep_float_tensor(name: str, t: Tensor) -> bool:
+    if should_force_quantize_tensor(name):
+        return False
+    if name_matches_any(name, INT8_KEEP_FLOAT_NAME_PATTERNS) or name_matches_any(name, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
+        return True
+    return t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL
+
+def should_quantize_float_tensor(name: str, t: Tensor, include_small: bool = False) -> bool:
+    if not t.is_floating_point():
+        return False
+    if should_force_quantize_tensor(name):
+        return True
+    if name_matches_any(name, INT8_KEEP_FLOAT_NAME_PATTERNS) or name_matches_any(name, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
+        return False
+    return include_small or t.numel() > INT8_KEEP_FLOAT_MAX_NUMEL
+
 def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
-    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
+    if name_matches_any(name, INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
         return t.float().contiguous()
     if t.dtype in {torch.float32, torch.bfloat16}:
         passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
@@ -626,6 +681,35 @@ def unpack_ternary(packed: Tensor, original_shape: tuple, device: torch.device) 
     unpacked = unpacked.flatten() - 1
     numel = math.prod(original_shape)
     return unpacked[:numel].view(original_shape).to(LOW_PRECISION_DTYPE)
+
+def quantize_ternary_latent_tensor(t: Tensor, group_size: int = 0) -> tuple[Tensor, Tensor]:
+    t32 = t.float()
+    if group_size <= 0 or group_size >= t32.shape[1]:
+        scale = t32.abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
+        ternary = torch.round(t32 / scale).clamp(-1, 1).to(torch.int8)
+        return ternary, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE)
+
+    ternary_chunks: list[Tensor] = []
+    scale_chunks: list[Tensor] = []
+    for start in range(0, t32.shape[1], group_size):
+        end = min(start + group_size, t32.shape[1])
+        chunk = t32[:, start:end]
+        scale = chunk.abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
+        ternary_chunks.append(torch.round(chunk / scale).clamp(-1, 1).to(torch.int8))
+        scale_chunks.append(scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE))
+    return torch.cat(ternary_chunks, dim=1), torch.cat(scale_chunks, dim=1)
+
+def apply_groupwise_row_scales(t: Tensor, scales: Tensor, group_size: int) -> Tensor:
+    if scales.ndim != 2 or scales.shape[1] == 1 or group_size <= 0:
+        return t * scales.to(dtype=t.dtype)
+
+    out = torch.empty_like(t)
+    group_idx = 0
+    for start in range(0, t.shape[1], group_size):
+        end = min(start + group_size, t.shape[1])
+        out[:, start:end] = t[:, start:end] * scales[:, group_idx : group_idx + 1].to(dtype=t.dtype)
+        group_idx += 1
+    return out
 
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
@@ -672,10 +756,13 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
         stats["baseline_tensor_bytes"] += tensor_nbytes(t)
 
         if name.endswith(".weight_latent"):
-            scale = t.abs().mean(dim=1, keepdim=True).clamp(min=1e-5).to(dtype=INT8_PER_ROW_SCALE_DTYPE)
-            ternary = torch.round(t / scale).clamp(-1, 1).to(torch.int8)
+            ternary, scale = quantize_ternary_latent_tensor(t, BITLINEAR_GROUP_SIZE)
             packed = pack_ternary(ternary)
-            qmeta[name] = {"scheme": "ternary_packed", "shape": list(t.shape)}
+            qmeta[name] = {
+                "scheme": "ternary_packed_group" if scale.ndim == 2 and scale.shape[1] > 1 else "ternary_packed",
+                "shape": list(t.shape),
+                "group_size": BITLINEAR_GROUP_SIZE,
+            }
             quantized[name] = packed
             scales[name] = scale
             dtypes[name] = "ternary"
@@ -690,7 +777,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 
         # Small float tensors are cheap enough to keep directly. We still downcast
         # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+        if should_keep_float_tensor(name, t):
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
@@ -725,12 +812,23 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     for name, q in obj["quantized"].items():
         qmeta_item = qmeta.get(name, {})
         scheme = qmeta_item.get("scheme")
-        if scheme == "ternary_packed":
-            scale = obj["scales"][name].to(dtype=torch.float32).view(-1, 1)
+        if scheme in {"ternary_packed", "ternary_packed_group"}:
+            scale = obj["scales"][name].to(dtype=torch.float32)
             shape = tuple(qmeta_item["shape"])
+            group_size = int(qmeta_item.get("group_size", 0))
             ternary = unpack_ternary(q, shape, "cpu")
-            sparsity = ternary.float().abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
-            out[name] = (ternary.float() * scale / sparsity).to(LOW_PRECISION_DTYPE).contiguous()
+            reconstructed = apply_groupwise_row_scales(ternary.float(), scale, group_size)
+            if scale.ndim == 2 and scale.shape[1] > 1:
+                sparsity = torch.empty((ternary.shape[0], scale.shape[1]), dtype=torch.float32)
+                group_idx = 0
+                for start in range(0, ternary.shape[1], group_size):
+                    end = min(start + group_size, ternary.shape[1])
+                    sparsity[:, group_idx : group_idx + 1] = ternary[:, start:end].float().abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
+                    group_idx += 1
+                out[name] = (reconstructed / torch.repeat_interleave(sparsity, repeats=group_size, dim=1)[:, : ternary.shape[1]]).to(LOW_PRECISION_DTYPE).contiguous()
+            else:
+                sparsity = ternary.float().abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
+                out[name] = (reconstructed / sparsity).to(LOW_PRECISION_DTYPE).contiguous()
             continue
 
         dtype = getattr(torch, obj["dtypes"][name])
@@ -902,7 +1000,14 @@ def unpack_pgq2(data: bytes) -> dict:
             obj["scales"][name] = s
             obj["dtypes"][name] = orig_dtype_str.replace("torch.", "")
             if scheme_code == 12:
-                obj["qmeta"][name] = {"scheme": "ternary_packed", "shape": shape}
+                qmeta_item = {"shape": shape}
+                if len(shape) == 2 and s.numel() > shape[0]:
+                    qmeta_item["scheme"] = "ternary_packed_group"
+                    qmeta_item["group_size"] = math.ceil(shape[1] / max(int(s.numel() // shape[0]), 1))
+                else:
+                    qmeta_item["scheme"] = "ternary_packed"
+                    qmeta_item["group_size"] = 0
+                obj["qmeta"][name] = qmeta_item
             else:
                 obj["qmeta"][name] = {"scheme": "per_row", "axis": 0}
                 
@@ -934,12 +1039,12 @@ def unpack_pgq2(data: bytes) -> dict:
 
 
 @torch.no_grad()
-def project_model_to_export_grid(model: nn.Module) -> None:
-    for name, p in get_export_project_params(model):
+def project_model_to_export_grid(model: nn.Module, include_small: bool = False) -> None:
+    for name, p in get_export_project_params(model, include_small=include_small):
         if name.endswith(".weight_latent"):
-            scale = p.abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
-            ternary = torch.round(p / scale).clamp(-1, 1)
-            p.data.copy_((ternary * scale).to(dtype=p.dtype))
+            ternary, scale = quantize_ternary_latent_tensor(p.data, BITLINEAR_GROUP_SIZE)
+            restored = apply_groupwise_row_scales(ternary.float(), scale.float(), BITLINEAR_GROUP_SIZE)
+            p.data.copy_(restored.to(dtype=p.dtype))
             continue
             
         q, s = quantize_float_tensor(p.data)
@@ -948,6 +1053,24 @@ def project_model_to_export_grid(model: nn.Module) -> None:
         else:
             restored = q.float() * float(s.item())
         p.data.copy_(restored.to(dtype=p.dtype))
+
+def compute_export_grid_regularizer(model: nn.Module, include_small: bool = False) -> Tensor:
+    penalties: list[Tensor] = []
+    for name, p in get_export_project_params(model, include_small=include_small):
+        target = p.detach()
+        if name.endswith(".weight_latent"):
+            ternary, scale = quantize_ternary_latent_tensor(target, BITLINEAR_GROUP_SIZE)
+            target = apply_groupwise_row_scales(ternary.float(), scale.float(), BITLINEAR_GROUP_SIZE).to(dtype=p.dtype)
+        else:
+            q, s = quantize_float_tensor(target)
+            if s.ndim > 0:
+                target = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1))).float()).to(dtype=p.dtype)
+            else:
+                target = (q.float() * float(s.item())).to(dtype=p.dtype)
+        penalties.append((p.float() - target.float()).square().mean())
+    if not penalties:
+        return torch.zeros((), device=next(model.parameters()).device)
+    return torch.stack(penalties).mean()
 
 
 # -----------------------------
@@ -1065,10 +1188,18 @@ class BitLinear(nn.Module):
             self.register_parameter('bias', None)
             
     def forward(self, x: Tensor) -> Tensor:
-        scale = self.weight_latent.detach().abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
-        weight_ternary = torch.round(self.weight_latent / scale).clamp(-1, 1)
-        w = weight_ternary.detach() - self.weight_latent.detach() + self.weight_latent
+        if BITLINEAR_GROUP_SIZE > 0:
+            weight_detached = self.weight_latent.detach()
+            ternary_detached, scale = quantize_ternary_latent_tensor(weight_detached, BITLINEAR_GROUP_SIZE)
+            weight_ternary = ternary_detached.detach() - weight_detached + self.weight_latent
+            w = apply_groupwise_row_scales(weight_ternary, scale.to(dtype=self.weight_latent.dtype), BITLINEAR_GROUP_SIZE)
+        else:
+            scale = self.weight_latent.detach().abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
+            weight_ternary = torch.round(self.weight_latent / scale).clamp(-1, 1)
+            w = weight_ternary.detach() - self.weight_latent.detach() + self.weight_latent
         bias = self.bias.to(x.dtype) if self.bias is not None else None
+        if BITLINEAR_GROUP_SIZE > 0:
+            return F.linear(x, w.to(dtype=x.dtype), bias)
         return F.linear(x, (w * scale).to(dtype=x.dtype), bias)
 
 class LowRankFastAdapter(nn.Module):
@@ -1486,6 +1617,8 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError(f"NUM_UNIQUE_MLP must be in [1, NUM_LAYERS], got {args.num_unique_mlp}")
     if args.qat_every_steps <= 0:
         raise ValueError(f"QAT_EVERY_STEPS must be positive, got {args.qat_every_steps}")
+    if args.compression_reg_every_steps <= 0:
+        raise ValueError(f"COMPRESSION_REG_EVERY_STEPS must be positive, got {args.compression_reg_every_steps}")
     if args.train_meta_steps < 0:
         raise ValueError(f"TRAIN_META_STEPS must be non-negative, got {args.train_meta_steps}")
     if args.train_meta_mode != "replace":
@@ -1503,6 +1636,10 @@ def main(argv: list[str] | None = None) -> None:
         )
     if args.eval_score <= 0:
         raise ValueError(f"EVAL_SCORE must be positive, got {args.eval_score}")
+    if not 0.0 <= args.compression_reg_start_frac <= 1.0:
+        raise ValueError(
+            f"COMPRESSION_REG_START_FRAC must be in [0, 1], got {args.compression_reg_start_frac}"
+        )
     if args.init_model_path and not Path(args.init_model_path).exists():
         raise FileNotFoundError(f"INIT_MODEL_PATH not found: {args.init_model_path}")
 
@@ -1763,6 +1900,13 @@ def main(argv: list[str] | None = None) -> None:
                 f"train_meta_loss_a_weight:{args.train_meta_loss_a_weight:.4f} "
                 f"train_meta_loss_b_weight:{args.train_meta_loss_b_weight:.4f}"
             )
+    if args.compression_reg_weight > 0.0:
+        log0(
+            f"compression_reg_weight:{args.compression_reg_weight:.6f} "
+            f"compression_reg_start_frac:{args.compression_reg_start_frac:.3f} "
+            f"compression_reg_every_steps:{args.compression_reg_every_steps} "
+            f"compression_reg_include_small_floats:{args.compression_reg_include_small_floats}"
+        )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1877,6 +2021,11 @@ def main(argv: list[str] | None = None) -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         qat_active = args.use_projection_qat and (elapsed_ms >= args.qat_start_ms)
+        compression_reg_active = (
+            args.compression_reg_weight > 0.0
+            and progress >= args.compression_reg_start_frac
+            and step % args.compression_reg_every_steps == 0
+        )
         scale = lr_mul(step, elapsed_ms)
         if qat_active:
             scale *= args.qat_lr_scale
@@ -1912,6 +2061,12 @@ def main(argv: list[str] | None = None) -> None:
                     loss_b = model(x_b, y_b, fast_state=fast_state_1)
                     meta_loss = args.train_meta_loss_a_weight * loss_a + args.train_meta_loss_b_weight * loss_b
                     loss = meta_loss
+                if compression_reg_active:
+                    reg = compute_export_grid_regularizer(
+                        base_model,
+                        include_small=args.compression_reg_include_small_floats,
+                    )
+                    loss = loss + args.compression_reg_weight * reg.to(dtype=loss.dtype)
 
                 train_loss += loss.detach()
                 (loss * grad_scale).backward()
@@ -1926,6 +2081,12 @@ def main(argv: list[str] | None = None) -> None:
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=LOW_PRECISION_DTYPE, enabled=True):
                     loss = model(x, y)
+                if compression_reg_active:
+                    reg = compute_export_grid_regularizer(
+                        base_model,
+                        include_small=args.compression_reg_include_small_floats,
+                    )
+                    loss = loss + args.compression_reg_weight * reg.to(dtype=loss.dtype)
                 train_loss += loss.detach()
                 (loss * grad_scale).backward()
             train_loss /= grad_accum_steps
@@ -1946,7 +2107,7 @@ def main(argv: list[str] | None = None) -> None:
         zero_grad_all()
         
         if qat_active and step % args.qat_every_steps == 0:
-            project_model_to_export_grid(base_model)
+            project_model_to_export_grid(base_model, include_small=args.qat_include_small_floats)
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
