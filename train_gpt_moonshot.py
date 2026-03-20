@@ -773,6 +773,22 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
+def load_init_state_dict(path: str) -> dict[str, Tensor]:
+    lower = path.lower()
+    if lower.endswith(".ptz"):
+        with open(path, "rb") as f:
+            quant_blob = f.read()
+        quant_state = unpack_pgq2(zlib.decompress(quant_blob))
+        return dequantize_state_dict_int8(quant_state)
+
+    loaded_obj = torch.load(path, map_location="cpu")
+    if isinstance(loaded_obj, dict) and loaded_obj.get("__quant_format__") == "int8_clean_per_row_v1":
+        return dequantize_state_dict_int8(loaded_obj)
+    if isinstance(loaded_obj, dict) and "state_dict" in loaded_obj and isinstance(loaded_obj["state_dict"], dict):
+        return loaded_obj["state_dict"]
+    return loaded_obj
+
+
 # -----------------------------
 # PGQ2 CUSTOM BINARY EXPORT
 # -----------------------------
@@ -1659,11 +1675,7 @@ def main(argv: list[str] | None = None) -> None:
         fast_gate_init=args.fast_gate_init,
     ).to(device=device, dtype=LOW_PRECISION_DTYPE)
     if args.init_model_path:
-        loaded_obj = torch.load(args.init_model_path, map_location="cpu")
-        if isinstance(loaded_obj, dict) and "state_dict" in loaded_obj and isinstance(loaded_obj["state_dict"], dict):
-            init_state = loaded_obj["state_dict"]
-        else:
-            init_state = loaded_obj
+        init_state = load_init_state_dict(args.init_model_path)
         load_result = base_model.load_state_dict(init_state, strict=args.init_model_strict)
         if not args.init_model_strict:
             missing = ", ".join(load_result.missing_keys[:8]) if load_result.missing_keys else ""
