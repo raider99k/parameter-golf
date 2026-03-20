@@ -147,9 +147,21 @@ class ExtremeGPT(base.GPT):
         self.recurrent_passes = int(os.environ.get("EXTREME_RECURRENT_PASSES", "1"))
         if self.recurrent_passes <= 0:
             raise ValueError(f"EXTREME_RECURRENT_PASSES must be positive, got {self.recurrent_passes}")
+        self.use_normformer_lite = bool(int(os.environ.get("EXTREME_NORMFORMER_LITE", "1")))
+        self.use_layer_modulation = bool(int(os.environ.get("EXTREME_LAYER_MODULATION", "1")))
         self.use_recurrent_gates = bool(int(os.environ.get("EXTREME_RECURRENT_GATES", "1")))
         self.use_depth_aware_residuals = bool(int(os.environ.get("EXTREME_DEPTH_AWARE_RESIDUALS", "1")))
         pass_gate_init = float(os.environ.get("EXTREME_PASS_GATE_INIT", "1.0"))
+        self.extreme_active = (
+            self.use_normformer_lite
+            or self.use_layer_modulation
+            or self.use_depth_aware_residuals
+            or self.recurrent_passes != 1
+        )
+        if not self.extreme_active:
+            self.use_recurrent_gates = False
+            self.pass_gates = None
+            return
         branch_scale_init = (
             depth_aware_branch_scale(num_layers, self.recurrent_passes)
             if self.use_depth_aware_residuals else 1.0
@@ -202,17 +214,23 @@ class ExtremeGPT(base.GPT):
         fast_state: dict[str, Tensor] | None = None,
         loss_mask: Tensor | None = None,
     ) -> Tensor:
+        if not self.extreme_active:
+            return super().forward(input_ids, target_ids, fast_state=fast_state, loss_mask=loss_mask)
+
         x = self.tok_emb(input_ids)
         if getattr(self, "emb_proj", None) is not None:
             x = self.emb_proj(x)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
 
-        for pass_idx in range(self.recurrent_passes):
-            x_in = x
-            x_out = self._run_stack(x, x0, fast_state=fast_state)
-            gate = self.pass_gates[pass_idx].to(dtype=x.dtype)[None, None, :]
-            x = x_in + gate * (x_out - x_in)
+        if self.recurrent_passes == 1:
+            x = self._run_stack(x, x0, fast_state=fast_state)
+        else:
+            for pass_idx in range(self.recurrent_passes):
+                x_in = x
+                x_out = self._run_stack(x, x0, fast_state=fast_state)
+                gate = self.pass_gates[pass_idx].to(dtype=x.dtype)[None, None, :]
+                x = x_in + gate * (x_out - x_in)
 
         x = self.final_norm(x)
         if self.out_fast is not None:
