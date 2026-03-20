@@ -117,6 +117,7 @@ class Hyperparameters:
     train_meta_aux_weight = float(os.environ.get("TRAIN_META_AUX_WEIGHT", 0.25))
     train_meta_loss_a_weight = float(os.environ.get("TRAIN_META_LOSS_A_WEIGHT", 0.2))
     train_meta_loss_b_weight = float(os.environ.get("TRAIN_META_LOSS_B_WEIGHT", 0.8))
+    train_meta_adapter_only = bool(int(os.environ.get("TRAIN_META_ADAPTER_ONLY", 1)))
 
     # Streaming eval with causal adaptation
     eval_window = int(os.environ.get("EVAL_WINDOW", 4096))
@@ -208,6 +209,7 @@ class Hyperparameters:
         self.train_meta_aux_weight = float(os.environ.get("TRAIN_META_AUX_WEIGHT", 0.25))
         self.train_meta_loss_a_weight = float(os.environ.get("TRAIN_META_LOSS_A_WEIGHT", 0.2))
         self.train_meta_loss_b_weight = float(os.environ.get("TRAIN_META_LOSS_B_WEIGHT", 0.8))
+        self.train_meta_adapter_only = bool(int(os.environ.get("TRAIN_META_ADAPTER_ONLY", 1)))
 
         # Streaming eval with causal adaptation
         self.eval_window = int(os.environ.get("EVAL_WINDOW", 4096))
@@ -277,6 +279,7 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "TRAIN_META_AUX_WEIGHT",
     "TRAIN_META_LOSS_A_WEIGHT",
     "TRAIN_META_LOSS_B_WEIGHT",
+    "TRAIN_META_ADAPTER_ONLY",
     "TRAIN_META_MIN_SEQS_PER_SIDE",
     "TRAIN_META_START_FRAC",
     "TRAIN_META_STEPS",
@@ -1409,6 +1412,17 @@ def detach_fast_state(state: dict[str, Tensor]) -> dict[str, Tensor]:
 def iter_fast_adapters(module: nn.Module) -> list[LowRankFastAdapter]:
     return [m for m in module.modules() if isinstance(m, LowRankFastAdapter)]
 
+def iter_fast_adapter_params(module: nn.Module) -> list[nn.Parameter]:
+    params: list[nn.Parameter] = []
+    seen: set[int] = set()
+    for adapter in iter_fast_adapters(module):
+        for param in adapter.parameters():
+            if id(param) in seen:
+                continue
+            seen.add(id(param))
+            params.append(param)
+    return params
+
 def adapt_fast_state(
     model: nn.Module,
     fast_state: dict[str, Tensor],
@@ -1483,6 +1497,8 @@ def main(argv: list[str] | None = None) -> None:
             "TRAIN_META_LOSS_A_WEIGHT and TRAIN_META_LOSS_B_WEIGHT must be non-negative, "
             f"got {args.train_meta_loss_a_weight} and {args.train_meta_loss_b_weight}"
         )
+    if args.train_meta_adapter_only and not args.use_fast_adapters:
+        raise ValueError("TRAIN_META_ADAPTER_ONLY requires USE_FAST_ADAPTERS=1")
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1619,6 +1635,7 @@ def main(argv: list[str] | None = None) -> None:
     restore_low_dim_params_to_fp32(base_model)
     fast_state_keys = build_fast_state_keys(args.num_unique_attn, args.num_unique_mlp) if args.use_fast_adapters else ()
     fast_adapters = tuple(iter_fast_adapters(base_model)) if args.use_fast_adapters else ()
+    fast_adapter_params = tuple(iter_fast_adapter_params(base_model)) if args.use_fast_adapters else ()
     zero_fast_state_template = (
         init_fast_state(args.fast_rank, device, fast_state_keys)
         if fast_adapters
@@ -1723,7 +1740,8 @@ def main(argv: list[str] | None = None) -> None:
             log0(
                 f"train_meta_aux_weight:{args.train_meta_aux_weight:.4f} "
                 f"train_meta_loss_a_weight:{args.train_meta_loss_a_weight:.4f} "
-                f"train_meta_loss_b_weight:{args.train_meta_loss_b_weight:.4f}"
+                f"train_meta_loss_b_weight:{args.train_meta_loss_b_weight:.4f} "
+                f"train_meta_adapter_only:{args.train_meta_adapter_only}"
             )
     log0(f"seed:{args.seed}")
 
@@ -1878,7 +1896,24 @@ def main(argv: list[str] | None = None) -> None:
                     loss = loss_main + args.train_meta_aux_weight * meta_loss
 
                 train_loss += loss.detach()
-                (loss * grad_scale).backward()
+                (loss_main * grad_scale).backward()
+                if args.train_meta_aux_weight > 0.0:
+                    if args.train_meta_adapter_only and fast_adapter_params:
+                        meta_grads = torch.autograd.grad(
+                            args.train_meta_aux_weight * meta_loss * grad_scale,
+                            fast_adapter_params,
+                            allow_unused=True,
+                        )
+                        for param, grad in zip(fast_adapter_params, meta_grads, strict=True):
+                            if grad is None:
+                                continue
+                            grad = grad.detach()
+                            if param.grad is None:
+                                param.grad = grad
+                            else:
+                                param.grad.add_(grad)
+                    else:
+                        (args.train_meta_aux_weight * meta_loss * grad_scale).backward()
 
             train_loss /= grad_accum_steps
         else:
