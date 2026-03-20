@@ -110,6 +110,7 @@ class Hyperparameters:
     fast_gate_init = float(os.environ.get("FAST_GATE_INIT", 0.05))
 
     # Meta-style training schedule
+    train_meta_mode = os.environ.get("TRAIN_META_MODE", "aux").strip().lower()
     train_meta_every = int(os.environ.get("TRAIN_META_EVERY", 2))
     train_meta_start_frac = float(os.environ.get("TRAIN_META_START_FRAC", 0.70))
     train_meta_end_frac = float(os.environ.get("TRAIN_META_END_FRAC", 0.90))
@@ -206,6 +207,7 @@ class Hyperparameters:
         self.fast_gate_init = float(os.environ.get("FAST_GATE_INIT", 0.05))
 
         # Meta-style training schedule
+        self.train_meta_mode = os.environ.get("TRAIN_META_MODE", "aux").strip().lower()
         self.train_meta_every = int(os.environ.get("TRAIN_META_EVERY", 2))
         self.train_meta_start_frac = float(os.environ.get("TRAIN_META_START_FRAC", 0.70))
         self.train_meta_end_frac = float(os.environ.get("TRAIN_META_END_FRAC", 0.90))
@@ -290,6 +292,7 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "TRAIN_META_LOSS_A_WEIGHT",
     "TRAIN_META_LOSS_B_WEIGHT",
     "TRAIN_META_ADAPTER_ONLY",
+    "TRAIN_META_MODE",
     "TRAIN_META_FREEZE_BACKBONE",
     "TRAIN_META_MIN_SEQS_PER_SIDE",
     "TRAIN_META_SAME_SHARD",
@@ -1525,6 +1528,8 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError(f"QAT_EVERY_STEPS must be positive, got {args.qat_every_steps}")
     if args.train_meta_steps < 0:
         raise ValueError(f"TRAIN_META_STEPS must be non-negative, got {args.train_meta_steps}")
+    if args.train_meta_mode not in {"replace", "aux"}:
+        raise ValueError(f"TRAIN_META_MODE must be one of replace, aux; got {args.train_meta_mode!r}")
     if args.use_fast_adapters and args.fast_gate_init <= 0.0:
         raise ValueError(f"FAST_GATE_INIT must be positive when fast adapters are enabled, got {args.fast_gate_init}")
     if args.train_meta_min_seqs_per_side <= 0:
@@ -1538,9 +1543,10 @@ def main(argv: list[str] | None = None) -> None:
             "TRAIN_META_LOSS_A_WEIGHT and TRAIN_META_LOSS_B_WEIGHT must be non-negative, "
             f"got {args.train_meta_loss_a_weight} and {args.train_meta_loss_b_weight}"
         )
-    if args.train_meta_adapter_only and not args.use_fast_adapters:
+    meta_training_configured = args.train_meta_every > 0 and args.train_meta_steps > 0
+    if args.train_meta_adapter_only and meta_training_configured and not args.use_fast_adapters:
         raise ValueError("TRAIN_META_ADAPTER_ONLY requires USE_FAST_ADAPTERS=1")
-    if args.train_meta_freeze_backbone and not args.use_fast_adapters:
+    if args.train_meta_freeze_backbone and meta_training_configured and not args.use_fast_adapters:
         raise ValueError("TRAIN_META_FREEZE_BACKBONE requires USE_FAST_ADAPTERS=1")
     if args.init_model_path and not Path(args.init_model_path).exists():
         raise FileNotFoundError(f"INIT_MODEL_PATH not found: {args.init_model_path}")
@@ -1800,6 +1806,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         if args.train_meta_every > 0 and args.train_meta_steps > 0:
             log0(
+                f"train_meta_mode:{args.train_meta_mode} "
                 f"train_meta_aux_weight:{args.train_meta_aux_weight:.4f} "
                 f"train_meta_loss_a_weight:{args.train_meta_loss_a_weight:.4f} "
                 f"train_meta_loss_b_weight:{args.train_meta_loss_b_weight:.4f} "
@@ -1934,8 +1941,6 @@ def main(argv: list[str] | None = None) -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
 
-                x_main, y_main = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-
                 pair_tokens = meta_pair_tokens
                 local = train_loader.next_local_span(meta_local_tokens + 1, same_file=args.train_meta_same_shard)
                 x_a = local[:pair_tokens].reshape(-1, args.train_seq_len)
@@ -1945,7 +1950,6 @@ def main(argv: list[str] | None = None) -> None:
 
                 zero_state = clone_fast_state(zero_fast_state_template) if zero_fast_state_template is not None else {}
                 with torch.autocast(device_type="cuda", dtype=LOW_PRECISION_DTYPE, enabled=True):
-                    loss_main = model(x_main, y_main)
                     loss_a = model(x_a, y_a, fast_state=zero_state)
                     fast_state_1 = adapt_fast_state(
                         model,
@@ -1960,27 +1964,35 @@ def main(argv: list[str] | None = None) -> None:
                     )
                     loss_b = model(x_b, y_b, fast_state=fast_state_1)
                     meta_loss = args.train_meta_loss_a_weight * loss_a + args.train_meta_loss_b_weight * loss_b
-                    loss = loss_main + args.train_meta_aux_weight * meta_loss
+                    if args.train_meta_mode == "replace":
+                        loss = meta_loss
+                    else:
+                        x_main, y_main = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                        loss_main = model(x_main, y_main)
+                        loss = loss_main + args.train_meta_aux_weight * meta_loss
 
                 train_loss += loss.detach()
-                (loss_main * grad_scale).backward()
-                if args.train_meta_aux_weight > 0.0:
-                    if args.train_meta_adapter_only and fast_adapter_params:
-                        meta_grads = torch.autograd.grad(
-                            args.train_meta_aux_weight * meta_loss * grad_scale,
-                            fast_adapter_params,
-                            allow_unused=True,
-                        )
-                        for param, grad in zip(fast_adapter_params, meta_grads, strict=True):
-                            if grad is None:
-                                continue
-                            grad = grad.detach()
-                            if param.grad is None:
-                                param.grad = grad
-                            else:
-                                param.grad.add_(grad)
-                    else:
-                        (args.train_meta_aux_weight * meta_loss * grad_scale).backward()
+                if args.train_meta_mode == "replace":
+                    (loss * grad_scale).backward()
+                else:
+                    (loss_main * grad_scale).backward()
+                    if args.train_meta_aux_weight > 0.0:
+                        if args.train_meta_adapter_only and fast_adapter_params:
+                            meta_grads = torch.autograd.grad(
+                                args.train_meta_aux_weight * meta_loss * grad_scale,
+                                fast_adapter_params,
+                                allow_unused=True,
+                            )
+                            for param, grad in zip(fast_adapter_params, meta_grads, strict=True):
+                                if grad is None:
+                                    continue
+                                grad = grad.detach()
+                                if param.grad is None:
+                                    param.grad = grad
+                                else:
+                                    param.grad.add_(grad)
+                        else:
+                            (args.train_meta_aux_weight * meta_loss * grad_scale).backward()
                 if freeze_backbone_active:
                     mask_grads_to_param_ids(base_model, fast_adapter_param_ids)
 
