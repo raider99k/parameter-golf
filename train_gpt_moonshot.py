@@ -114,6 +114,9 @@ class Hyperparameters:
     train_meta_steps = int(os.environ.get("TRAIN_META_STEPS", 1))
     train_meta_first_order = bool(int(os.environ.get("TRAIN_META_FIRST_ORDER", 1)))
     train_meta_min_seqs_per_side = int(os.environ.get("TRAIN_META_MIN_SEQS_PER_SIDE", 4))
+    train_meta_aux_weight = float(os.environ.get("TRAIN_META_AUX_WEIGHT", 0.25))
+    train_meta_loss_a_weight = float(os.environ.get("TRAIN_META_LOSS_A_WEIGHT", 0.2))
+    train_meta_loss_b_weight = float(os.environ.get("TRAIN_META_LOSS_B_WEIGHT", 0.8))
 
     # Streaming eval with causal adaptation
     eval_window = int(os.environ.get("EVAL_WINDOW", 4096))
@@ -202,6 +205,9 @@ class Hyperparameters:
         self.train_meta_steps = int(os.environ.get("TRAIN_META_STEPS", 1))
         self.train_meta_first_order = bool(int(os.environ.get("TRAIN_META_FIRST_ORDER", 1)))
         self.train_meta_min_seqs_per_side = int(os.environ.get("TRAIN_META_MIN_SEQS_PER_SIDE", 4))
+        self.train_meta_aux_weight = float(os.environ.get("TRAIN_META_AUX_WEIGHT", 0.25))
+        self.train_meta_loss_a_weight = float(os.environ.get("TRAIN_META_LOSS_A_WEIGHT", 0.2))
+        self.train_meta_loss_b_weight = float(os.environ.get("TRAIN_META_LOSS_B_WEIGHT", 0.8))
 
         # Streaming eval with causal adaptation
         self.eval_window = int(os.environ.get("EVAL_WINDOW", 4096))
@@ -268,6 +274,9 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "TRAIN_META_END_FRAC",
     "TRAIN_META_EVERY",
     "TRAIN_META_FIRST_ORDER",
+    "TRAIN_META_AUX_WEIGHT",
+    "TRAIN_META_LOSS_A_WEIGHT",
+    "TRAIN_META_LOSS_B_WEIGHT",
     "TRAIN_META_MIN_SEQS_PER_SIDE",
     "TRAIN_META_START_FRAC",
     "TRAIN_META_STEPS",
@@ -1467,6 +1476,13 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError(
             f"TRAIN_META_MIN_SEQS_PER_SIDE must be positive, got {args.train_meta_min_seqs_per_side}"
         )
+    if args.train_meta_aux_weight < 0.0:
+        raise ValueError(f"TRAIN_META_AUX_WEIGHT must be non-negative, got {args.train_meta_aux_weight}")
+    if args.train_meta_loss_a_weight < 0.0 or args.train_meta_loss_b_weight < 0.0:
+        raise ValueError(
+            "TRAIN_META_LOSS_A_WEIGHT and TRAIN_META_LOSS_B_WEIGHT must be non-negative, "
+            f"got {args.train_meta_loss_a_weight} and {args.train_meta_loss_b_weight}"
+        )
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1703,6 +1719,12 @@ def main(argv: list[str] | None = None) -> None:
             f"meta_pair_tokens:{meta_pair_tokens} meta_local_tokens:{meta_local_tokens} "
             f"train_meta_min_seqs_per_side:{args.train_meta_min_seqs_per_side}"
         )
+        if args.train_meta_every > 0 and args.train_meta_steps > 0:
+            log0(
+                f"train_meta_aux_weight:{args.train_meta_aux_weight:.4f} "
+                f"train_meta_loss_a_weight:{args.train_meta_loss_a_weight:.4f} "
+                f"train_meta_loss_b_weight:{args.train_meta_loss_b_weight:.4f}"
+            )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1827,6 +1849,8 @@ def main(argv: list[str] | None = None) -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
 
+                x_main, y_main = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+
                 pair_tokens = meta_pair_tokens
                 local = train_loader.next_local_span(meta_local_tokens + 1)
                 x_a = local[:pair_tokens].reshape(-1, args.train_seq_len)
@@ -1836,6 +1860,7 @@ def main(argv: list[str] | None = None) -> None:
 
                 zero_state = clone_fast_state(zero_fast_state_template) if zero_fast_state_template is not None else {}
                 with torch.autocast(device_type="cuda", dtype=LOW_PRECISION_DTYPE, enabled=True):
+                    loss_main = model(x_main, y_main)
                     loss_a = model(x_a, y_a, fast_state=zero_state)
                     fast_state_1 = adapt_fast_state(
                         model,
@@ -1849,7 +1874,8 @@ def main(argv: list[str] | None = None) -> None:
                         adapters=fast_adapters,
                     )
                     loss_b = model(x_b, y_b, fast_state=fast_state_1)
-                    loss = 0.2 * loss_a + 0.8 * loss_b
+                    meta_loss = args.train_meta_loss_a_weight * loss_a + args.train_meta_loss_b_weight * loss_b
+                    loss = loss_main + args.train_meta_aux_weight * meta_loss
 
                 train_loss += loss.detach()
                 (loss * grad_scale).backward()
