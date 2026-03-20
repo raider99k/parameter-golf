@@ -1965,7 +1965,6 @@ def main(argv: list[str] | None = None) -> None:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"meta_active:{meta_active} meta_phase_active:{meta_phase_active} "
-                f"freeze_backbone_active:{freeze_backbone_active} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
