@@ -123,6 +123,11 @@ class Hyperparameters:
     train_meta_adapter_only = bool(int(os.environ.get("TRAIN_META_ADAPTER_ONLY", 1)))
     train_meta_freeze_backbone = bool(int(os.environ.get("TRAIN_META_FREEZE_BACKBONE", 0)))
     train_meta_same_shard = bool(int(os.environ.get("TRAIN_META_SAME_SHARD", 1)))
+    train_meta_document_episodes = bool(int(os.environ.get("TRAIN_META_DOCUMENT_EPISODES", 0)))
+    train_meta_batch_docs = int(os.environ.get("TRAIN_META_BATCH_DOCS", 8))
+    train_meta_adapt_tokens = int(os.environ.get("TRAIN_META_ADAPT_TOKENS", 3072))
+    train_meta_query_tokens = int(os.environ.get("TRAIN_META_QUERY_TOKENS", 1024))
+    train_meta_doc_bos_id = int(os.environ.get("TRAIN_META_DOC_BOS_ID", 1))
 
     # Streaming eval with causal adaptation
     eval_window = int(os.environ.get("EVAL_WINDOW", 4096))
@@ -220,6 +225,11 @@ class Hyperparameters:
         self.train_meta_adapter_only = bool(int(os.environ.get("TRAIN_META_ADAPTER_ONLY", 1)))
         self.train_meta_freeze_backbone = bool(int(os.environ.get("TRAIN_META_FREEZE_BACKBONE", 0)))
         self.train_meta_same_shard = bool(int(os.environ.get("TRAIN_META_SAME_SHARD", 1)))
+        self.train_meta_document_episodes = bool(int(os.environ.get("TRAIN_META_DOCUMENT_EPISODES", 0)))
+        self.train_meta_batch_docs = int(os.environ.get("TRAIN_META_BATCH_DOCS", 8))
+        self.train_meta_adapt_tokens = int(os.environ.get("TRAIN_META_ADAPT_TOKENS", os.environ.get("EVAL_ADAPT", "3072")))
+        self.train_meta_query_tokens = int(os.environ.get("TRAIN_META_QUERY_TOKENS", os.environ.get("EVAL_SCORE", "1024")))
+        self.train_meta_doc_bos_id = int(os.environ.get("TRAIN_META_DOC_BOS_ID", 1))
 
         # Streaming eval with causal adaptation
         self.eval_window = int(os.environ.get("EVAL_WINDOW", 4096))
@@ -292,6 +302,11 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "TRAIN_META_LOSS_A_WEIGHT",
     "TRAIN_META_LOSS_B_WEIGHT",
     "TRAIN_META_ADAPTER_ONLY",
+    "TRAIN_META_BATCH_DOCS",
+    "TRAIN_META_DOCUMENT_EPISODES",
+    "TRAIN_META_ADAPT_TOKENS",
+    "TRAIN_META_QUERY_TOKENS",
+    "TRAIN_META_DOC_BOS_ID",
     "TRAIN_META_MODE",
     "TRAIN_META_FREEZE_BACKBONE",
     "TRAIN_META_MIN_SEQS_PER_SIDE",
@@ -1033,6 +1048,19 @@ class TokenStream:
         return chunk
 
 
+def find_documents_by_bos(tokens: Tensor, bos_id: int, include_next_bos: bool = True) -> list[tuple[int, int]]:
+    bos_positions = (tokens == bos_id).nonzero(as_tuple=True)[0].cpu().numpy()
+    docs: list[tuple[int, int]] = []
+    for i in range(len(bos_positions)):
+        start = int(bos_positions[i])
+        end = int(bos_positions[i + 1]) if i + 1 < len(bos_positions) else tokens.numel()
+        if include_next_bos and i + 1 < len(bos_positions):
+            end += 1
+        if end - start >= 2:
+            docs.append((start, end - start))
+    return docs
+
+
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
@@ -1058,6 +1086,66 @@ class DistributedTokenLoader:
         start = self.rank * local_tokens_plus_one
         local = chunk[start : start + local_tokens_plus_one].to(dtype=torch.int64)
         return local.to(self.device, non_blocking=True)
+
+
+class DistributedDocumentLoader:
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device, bos_id: int):
+        self.rank = rank
+        self.world_size = world_size
+        self.device = device
+        self.bos_id = bos_id
+        self.stream = TokenStream(pattern)
+        self.docs: list[tuple[int, int]] = []
+        self.doc_idx = 0
+        self.global_doc_idx = 0
+        self._refresh_docs()
+
+    def _refresh_docs(self) -> None:
+        while True:
+            self.docs = find_documents_by_bos(self.stream.tokens, self.bos_id)
+            self.doc_idx = 0
+            if self.docs:
+                return
+            self.stream._advance_file()
+
+    def next_documents(self, n: int, min_pred_tokens: int) -> list[Tensor]:
+        docs: list[Tensor] = []
+        while len(docs) < n:
+            if self.doc_idx >= len(self.docs):
+                self.stream._advance_file()
+                self._refresh_docs()
+                continue
+            start, doc_len = self.docs[self.doc_idx]
+            self.doc_idx += 1
+            take_this_rank = self.global_doc_idx % self.world_size == self.rank
+            self.global_doc_idx += 1
+            if not take_this_rank or (doc_len - 1) < min_pred_tokens:
+                continue
+            docs.append(self.stream.tokens[start : start + doc_len].to(dtype=torch.int64).clone())
+        return docs
+
+
+def sample_document_episode_batch(
+    docs: list[Tensor],
+    adapt_tokens: int,
+    query_tokens: int,
+    device: torch.device,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    total_tokens = adapt_tokens + query_tokens
+    batch = torch.zeros(len(docs), total_tokens + 1, dtype=torch.int64, device=device)
+    for i, doc in enumerate(docs):
+        pred_len = doc.numel() - 1
+        max_start = pred_len - total_tokens
+        start = random.randint(0, max_start) if max_start > 0 else 0
+        span = doc[start : start + total_tokens + 1].to(device=device, non_blocking=True)
+        batch[i] = span
+    x_full = batch[:, :-1]
+    y_full = batch[:, 1:]
+    prefix_mask = torch.zeros_like(y_full, dtype=torch.float32)
+    query_mask = torch.zeros_like(y_full, dtype=torch.float32)
+    prefix_mask[:, :adapt_tokens] = 1.0
+    query_mask[:, adapt_tokens:] = 1.0
+    return x_full, y_full, prefix_mask, query_mask
 
 # -----------------------------
 # TRANSFORMER MODULES
@@ -1543,6 +1631,13 @@ def main(argv: list[str] | None = None) -> None:
             "TRAIN_META_LOSS_A_WEIGHT and TRAIN_META_LOSS_B_WEIGHT must be non-negative, "
             f"got {args.train_meta_loss_a_weight} and {args.train_meta_loss_b_weight}"
         )
+    if args.train_meta_batch_docs <= 0:
+        raise ValueError(f"TRAIN_META_BATCH_DOCS must be positive, got {args.train_meta_batch_docs}")
+    if args.train_meta_adapt_tokens <= 0 or args.train_meta_query_tokens <= 0:
+        raise ValueError(
+            "TRAIN_META_ADAPT_TOKENS and TRAIN_META_QUERY_TOKENS must be positive, "
+            f"got {args.train_meta_adapt_tokens} and {args.train_meta_query_tokens}"
+        )
     meta_training_configured = args.train_meta_every > 0 and args.train_meta_steps > 0
     if args.train_meta_adapter_only and meta_training_configured and not args.use_fast_adapters:
         raise ValueError("TRAIN_META_ADAPTER_ONLY requires USE_FAST_ADAPTERS=1")
@@ -1813,6 +1908,14 @@ def main(argv: list[str] | None = None) -> None:
                 f"train_meta_adapter_only:{args.train_meta_adapter_only} "
                 f"train_meta_freeze_backbone:{args.train_meta_freeze_backbone}"
             )
+            if args.train_meta_document_episodes:
+                log0(
+                    f"train_meta_document_episodes:True "
+                    f"train_meta_batch_docs:{args.train_meta_batch_docs} "
+                    f"train_meta_adapt_tokens:{args.train_meta_adapt_tokens} "
+                    f"train_meta_query_tokens:{args.train_meta_query_tokens} "
+                    f"train_meta_doc_bos_id:{args.train_meta_doc_bos_id}"
+                )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1820,6 +1923,11 @@ def main(argv: list[str] | None = None) -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    meta_doc_loader = (
+        DistributedDocumentLoader(args.train_files, rank, world_size, device, args.train_meta_doc_bos_id)
+        if args.train_meta_document_episodes and meta_training_configured
+        else None
+    )
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1865,6 +1973,11 @@ def main(argv: list[str] | None = None) -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        meta_doc_loader = (
+            DistributedDocumentLoader(args.train_files, rank, world_size, device, args.train_meta_doc_bos_id)
+            if args.train_meta_document_episodes and meta_training_configured
+            else None
+        )
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1941,12 +2054,30 @@ def main(argv: list[str] | None = None) -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
 
-                pair_tokens = meta_pair_tokens
-                local = train_loader.next_local_span(meta_local_tokens + 1, same_file=args.train_meta_same_shard)
-                x_a = local[:pair_tokens].reshape(-1, args.train_seq_len)
-                y_a = local[1 : pair_tokens + 1].reshape(-1, args.train_seq_len)
-                x_b = local[pair_tokens : 2 * pair_tokens].reshape(-1, args.train_seq_len)
-                y_b = local[pair_tokens + 1 : 2 * pair_tokens + 1].reshape(-1, args.train_seq_len)
+                if args.train_meta_document_episodes:
+                    docs = meta_doc_loader.next_documents(
+                        args.train_meta_batch_docs,
+                        args.train_meta_adapt_tokens + args.train_meta_query_tokens,
+                    )
+                    x_full, y_full, prefix_mask, query_mask = sample_document_episode_batch(
+                        docs,
+                        args.train_meta_adapt_tokens,
+                        args.train_meta_query_tokens,
+                        device,
+                    )
+                    x_a = x_full[:, : args.train_meta_adapt_tokens]
+                    y_a = y_full[:, : args.train_meta_adapt_tokens]
+                    x_b = x_full
+                    y_b = y_full
+                    query_loss_mask = query_mask
+                else:
+                    pair_tokens = meta_pair_tokens
+                    local = train_loader.next_local_span(meta_local_tokens + 1, same_file=args.train_meta_same_shard)
+                    x_a = local[:pair_tokens].reshape(-1, args.train_seq_len)
+                    y_a = local[1 : pair_tokens + 1].reshape(-1, args.train_seq_len)
+                    x_b = local[pair_tokens : 2 * pair_tokens].reshape(-1, args.train_seq_len)
+                    y_b = local[pair_tokens + 1 : 2 * pair_tokens + 1].reshape(-1, args.train_seq_len)
+                    query_loss_mask = None
 
                 zero_state = clone_fast_state(zero_fast_state_template) if zero_fast_state_template is not None else {}
                 with torch.autocast(device_type="cuda", dtype=LOW_PRECISION_DTYPE, enabled=True):
@@ -1962,7 +2093,7 @@ def main(argv: list[str] | None = None) -> None:
                         detach_result=False,
                         adapters=fast_adapters,
                     )
-                    loss_b = model(x_b, y_b, fast_state=fast_state_1)
+                    loss_b = model(x_b, y_b, fast_state=fast_state_1, loss_mask=query_loss_mask)
                     meta_loss = args.train_meta_loss_a_weight * loss_a + args.train_meta_loss_b_weight * loss_b
                     if args.train_meta_mode == "replace":
                         loss = meta_loss

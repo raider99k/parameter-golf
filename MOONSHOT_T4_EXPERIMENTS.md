@@ -333,9 +333,87 @@ Conclusion:
 - But the legacy replace-style meta objective improves training enough to beat the no-meta backbone.
 - The gain appears to come from the training trajectory, not from runtime TTT.
 
+### Completed schedule sweep on `SEED=1337`
+
+These runs held the rest of the meta-replace recipe fixed and only changed the schedule or local meta context:
+
+| Variant | `val_bpb` | Notes |
+|---|---:|---|
+| `START=0.5, EVERY=4, CTX=8` | `2.8012` | original replace baseline |
+| `START=0.4, EVERY=4, CTX=8` | `2.8430` | clearly worse |
+| `START=0.6, EVERY=4, CTX=8` | `2.8095` | slightly worse |
+| `START=0.5, EVERY=2, CTX=8` | `2.7903` | better than baseline |
+| `START=0.5, EVERY=8, CTX=8` | `2.7904` | effectively tied with `EVERY=2` |
+| `START=0.5, EVERY=4, CTX=12` | `2.7763` | best fixed-seed schedule result |
+
+Takeaways:
+
+- `TRAIN_META_START_FRAC=0.5` remains the best start point.
+- `TRAIN_META_EVERY=2` and `8` both improved over `4` when `CTX=8`.
+- Increasing the local meta context from `8` to `12` sequences per side gave the strongest single fixed-seed gain.
+
+### Combined follow-up tests
+
+The schedule gains did not combine cleanly:
+
+| Variant | `val_bpb` |
+|---|---:|
+| `CTX=12, EVERY=4` | `2.7763` |
+| `CTX=12, EVERY=2` | `2.7831` |
+| `CTX=12, EVERY=8` | `2.8189` |
+
+This indicates a real interaction:
+
+- larger meta context helps
+- more frequent meta helps at `CTX=8`
+- but combining larger context with `EVERY=2` does not beat `CTX=12, EVERY=4`
+- `EVERY=8` becomes too sparse once the local meta context is larger
+
+### `100`-step coarse screen for fast rank and loss weights
+
+Using `CTX=12, EVERY=4` as the short-run baseline:
+
+| Variant | `val_bpb` | Outcome |
+|---|---:|---|
+| `FAST_RANK=2`, loss `0.2 / 0.8` | `3.2697` | baseline |
+| `FAST_RANK=1`, loss `0.2 / 0.8` | `3.6178` | unstable and much worse |
+| `FAST_RANK=4`, loss `0.2 / 0.8` | `3.5189` | unstable and much worse |
+| `FAST_RANK=2`, loss `0.1 / 0.9` | `3.2957` | worse |
+| `FAST_RANK=2`, loss `0.0 / 1.0` | `3.2794` | slightly worse |
+
+Short-run verdict:
+
+- `FAST_RANK=2` remains the only sensible setting from these tests
+- `TRAIN_META_LOSS_A_WEIGHT=0.2` and `TRAIN_META_LOSS_B_WEIGHT=0.8` remain the best loss split tested
+- none of these short-run screens justified promotion to the long-horizon main line
+
+### `CTX=12` three-seed comparison
+
+The `CTX=12, EVERY=4` line was checked across the same three seeds as the original `CTX=8, EVERY=4` main line:
+
+| Seed | `CTX=8, EVERY=4` | `CTX=12, EVERY=4` |
+|---:|---:|---:|
+| `1337` | `2.8012` | `2.7763` |
+| `2024` | `2.8217` | `2.8337` |
+| `3407` | `2.7627` | `2.7678` |
+
+Means:
+
+- `CTX=8, EVERY=4`: `2.7952`
+- `CTX=12, EVERY=4`: `2.7926`
+
+Interpretation:
+
+- `CTX=12` has a slightly better three-seed mean
+- but it only wins on `1/3` seeds
+- it loses on the strongest single seed (`3407`)
+- and it also loses on `2024`
+
+Because the mean advantage is tiny and the best single run remains `CTX=8`, `CTX=12` was **not** promoted to the main line.
+
 ## Current Winning Configuration
 
-This is the current winning Moonshot configuration from the experiments so far:
+This remains the current primary Moonshot configuration from the experiments so far:
 
 ```bash
 RUN_ID=moonshot_2x1_fe96_meta_replace_ctx8_1000 \
@@ -406,6 +484,12 @@ python train_gpt_moonshot.py
 
 Mean `val_bpb`: `2.7952`
 
+Why this remains the main line:
+
+- it still owns the best single observed run
+- the `CTX=12` follow-up did not beat it on `SEED=3407`
+- the `CTX=12` mean advantage was too small and too seed-dependent to justify switching
+
 ## Main Conclusions
 
 1. The winning direction is the Moonshot backbone, not the baseline script.
@@ -429,12 +513,41 @@ Mean `val_bpb`: `2.7952`
    - `EVAL_TTT_STEPS` did not improve validation
    - the benefit comes from how the replace-style meta objective shapes full training
 
-## Suggested Next Step
+## New Moonshot Meta Path
 
-The next meaningful experiments are small schedule sweeps on the winning meta-replace line:
+A new Moonshot-only meta-training path has been implemented in `train_gpt_moonshot.py` to better match the original meta-learning goal.
 
-1. `TRAIN_META_START_FRAC=0.4`
-2. `TRAIN_META_START_FRAC=0.6`
-3. `TRAIN_META_EVERY=2`
-4. `TRAIN_META_EVERY=8`
-5. `TRAIN_META_MIN_SEQS_PER_SIDE=12`
+What it does:
+
+- keeps the existing Moonshot fast-adapter / fast-state mechanism
+- replaces flat support/query token pairs with BOS-delimited document episodes when enabled
+- adapts on a support prefix from a single document
+- scores the outer loss only on a held-out continuation from that same document
+
+New controls:
+
+- `TRAIN_META_DOCUMENT_EPISODES=1`
+- `TRAIN_META_BATCH_DOCS`
+- `TRAIN_META_ADAPT_TOKENS`
+- `TRAIN_META_QUERY_TOKENS`
+- `TRAIN_META_DOC_BOS_ID`
+
+Interpretation:
+
+- this is much closer to the intended meta-learning setup than the original flat-stream replace objective
+- it is still a Moonshot training-path change, not yet a validated new winner
+- no leaderboard-quality benchmark has been recorded for this mode yet in the experiment log
+
+Status:
+
+- implemented locally in `train_gpt_moonshot.py`
+- compiles successfully
+- still needs real GPU experiments before promotion into the main configuration
+
+## Recommended Next Step
+
+After completing the schedule sweep and the `CTX=12` follow-up, the next meaningful experiments are:
+
+1. More seed checks on the `CTX=8, EVERY=4` main line if the goal is leaderboard robustness.
+2. A longer horizon on the best single-seed recipe (`SEED=3407`, `CTX=8`, `EVERY=4`) if wallclock budget allows.
+3. No further short-run tuning on `FAST_RANK` or the `loss_a/loss_b` split unless a new structural idea changes the meta objective itself.
