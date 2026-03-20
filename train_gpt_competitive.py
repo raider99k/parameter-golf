@@ -700,6 +700,8 @@ def quantize_ternary_latent_tensor(t: Tensor, group_size: int = 0) -> tuple[Tens
     return torch.cat(ternary_chunks, dim=1), torch.cat(scale_chunks, dim=1)
 
 def apply_groupwise_row_scales(t: Tensor, scales: Tensor, group_size: int) -> Tensor:
+    if scales.ndim == 1:
+        return t * scales.to(dtype=t.dtype)[:, None]
     if scales.ndim != 2 or scales.shape[1] == 1 or group_size <= 0:
         return t * scales.to(dtype=t.dtype)
 
