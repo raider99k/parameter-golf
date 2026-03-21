@@ -234,3 +234,133 @@ Locked Ada systems configuration for real follow-up runs:
 3. The first credible Ada systems regime is now locked:
    - `seq=1024`, `batch=32768`, `accum=1`, `meta_pair=8192`
 4. The next Ada work should resume the main experiment program under that locked systems setup rather than continue low-utilization calibration.
+
+## Protocol Reset: Trust Wallclock-Tracked Runs
+
+After the first Ada calibration and architecture sweeps, it became clear that some conclusions from the mixed fixed-step / small-batch / changed-systems regime should be treated as provisional.
+
+The key issue was simple:
+
+- once throughput and context changed materially, comparing final states from fixed-step runs stopped being a clean proxy for the `10min` competition objective
+- best performance could occur well before the final checkpoint
+
+To fix this, `train_gpt_competitive.py` was updated again to support:
+
+- `VAL_LOSS_EVERY_SECONDS`
+- `RESTORE_BEST_VAL_CHECKPOINT`
+- `best_val_update`
+- `best_val_summary`
+
+This changed the evaluation methodology:
+
+1. use fixed wallclock budgets for search
+2. validate at fixed wallclock intervals
+3. restore the best validation checkpoint before final roundtrip evaluation
+
+From this point onward, the most trustworthy Ada evidence comes from the locked wallclock-tracked regime, not from the earlier mixed protocol.
+
+## 180s Wallclock Re-Baseline
+
+All runs below used the same locked Ada systems config:
+
+- `TRAIN_SEQ_LEN=1024`
+- `TRAIN_BATCH_TOKENS=32768`
+- `GRAD_ACCUM_STEPS=1`
+- `TRAIN_META_PAIR_TOKENS=8192`
+- `MAX_WALLCLOCK_SECONDS=180`
+- `VAL_LOSS_EVERY_SECONDS=90`
+- `RESTORE_BEST_VAL_CHECKPOINT=1`
+
+### First clean 180s wallclock baseline
+
+| Variant | Params | Best `val_bpb` | Final int8 `val_bpb` | Total submission size int8+zlib |
+|---|---:|---:|---:|---:|
+| `8L 448d e320 4x2`, `MLP_MULT=2` | `4,521,445` | `1.8401` | `1.8438` | `3,639,868` bytes |
+| `8L 448d e320 4x2`, `MLP_MULT=3` | `5,326,053` | `1.8325` | `1.8356` | `4,454,750` bytes |
+| `8L 512d e384 4x2`, `MLP_MULT=2` | `5,874,213` | `1.8011` | `1.8022` | `4,663,512` bytes |
+
+### Interpretation
+
+1. Under a clean 180-second wallclock comparison, width was still the main lever.
+2. `MLP_MULT=3` helped at `448d`, but not enough to beat a wider `512d` model.
+3. This established the first clean wallclock-tracked main branch:
+   - `8L 512d e384 4x2`
+
+## Aggressive Ada Scaling Wave
+
+With the wallclock protocol locked, the search shifted to aggressive geometric jumps rather than conservative local nudges.
+
+### First aggressive wave
+
+| Variant | Params | Best `val_bpb` | Final int8 `val_bpb` | Total submission size int8+zlib |
+|---|---:|---:|---:|---:|
+| `8L 640d e512 4x2`, `MLP_MULT=2` | `9,095,845` | `1.7921` | `1.7942` | `7,091,031` bytes |
+| `10L 640d e512 5x2`, `MLP_MULT=2` | `10,334,892` | `1.8290` | `1.8317` | `8,535,631` bytes |
+| `8L 768d e640 4x2`, `MLP_MULT=2` | `13,005,605` | `1.7999` | `1.8016` | `10,021,860` bytes |
+
+### Interpretation
+
+1. Width still paid at least one more large step:
+   - `8L 640d e512 4x2` became the new leader.
+2. Depth continued to lose even after moving into the new wallclock-tracked regime:
+   - `10L 640d e512 5x2` was clearly worse.
+3. `768d` did not beat `640d`, which suggested that under a fixed `180s` budget, very large width was already running into wallclock-efficiency limits.
+
+## Ridge Search Around 640d
+
+After `640d` won, the search moved to the local ridge around that width while staying aggressive.
+
+### Follow-up runs
+
+| Variant | Params | Best `val_bpb` | Final int8 `val_bpb` | Total submission size int8+zlib |
+|---|---:|---:|---:|---:|
+| `8L 640d e512 4x2`, `MLP_MULT=3` | `10,736,805` | `1.7816` | `1.7832` | `8,743,097` bytes |
+| `8L 704d e576 4x2`, `MLP_MULT=2` | `10,964,709` | `1.8098` | `1.8102` | `8,493,112` bytes |
+| `8L 704d e576 4x2`, `MLP_MULT=3` | `12,949,989` | `1.8500` | `1.8500` | `10,485,195` bytes |
+| `8L 768d e640 4x2`, `MLP_MULT=3` | `15,367,973` | `1.7848` | `1.7872` | `12,390,285` bytes |
+| `8L 896d e704 4x2`, `MLP_MULT=2` | `17,480,613` | `1.8778` | `1.8808` | `13,341,459` bytes |
+| `8L 896d e704 4x2`, `MLP_MULT=3` | `20,695,461` | `1.9099` | `1.9123` | `16,562,753` bytes |
+
+### Interpretation
+
+1. `MLP_MULT=3` is now fully validated on the main Ada branch:
+   - `8L 640d e512 4x2 mlp3` is the best result so far.
+2. The local optimum under the current `180s` wallclock budget sits around `640d`, not `704d`, `768d`, or `896d`.
+3. Going past `640d` increased size and reduced wallclock efficiency without improving the metric enough.
+4. `8L 896d e704 4x2 mlp3` exceeded the `16MB` artifact cap and is not a valid submission direction.
+5. The depth branch should remain paused unless a later regime change creates new evidence.
+
+## Current Best Ada Line
+
+Under the current trusted wallclock-tracked methodology, the best line so far is:
+
+- `NUM_LAYERS=8`
+- `NUM_UNIQUE_ATTN=4`
+- `NUM_UNIQUE_MLP=2`
+- `MODEL_DIM=640`
+- `EMBED_DIM=512`
+- `MLP_MULT=3`
+- `TRAIN_SEQ_LEN=1024`
+- `TRAIN_BATCH_TOKENS=32768`
+- `GRAD_ACCUM_STEPS=1`
+- `TRAIN_META_PAIR_TOKENS=8192`
+- `MAX_WALLCLOCK_SECONDS=180`
+- `VAL_LOSS_EVERY_SECONDS=90`
+- `RESTORE_BEST_VAL_CHECKPOINT=1`
+
+Best observed result on `SEED=3407`:
+
+- params: `10,736,805`
+- best `val_bpb`: `1.7816`
+- final int8 roundtrip `val_bpb`: `1.7832`
+- total submission size int8+zlib: `8,743,097` bytes
+
+## Updated Current State Summary
+
+1. Older fixed-step / early-Ada results remain useful as exploration history, but they are no longer the strongest evidence base.
+2. The trusted current methodology is the wallclock-tracked Ada regime with best-checkpoint restore.
+3. The best current Ada line is:
+   - `8L 640d e512 4x2 mlp3`
+4. Width remains the dominant scaling lever.
+5. Depth is still losing under the current budget.
+6. There is still artifact-size headroom below `16MB`, but the current `180s` budget already shows diminishing returns past `640d`.
