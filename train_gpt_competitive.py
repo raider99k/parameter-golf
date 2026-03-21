@@ -129,6 +129,11 @@ class Hyperparameters:
     train_meta_steps = int(os.environ.get("TRAIN_META_STEPS", 1))
     train_meta_first_order = bool(int(os.environ.get("TRAIN_META_FIRST_ORDER", 1)))
     train_meta_min_seqs_per_side = int(os.environ.get("TRAIN_META_MIN_SEQS_PER_SIDE", 4))
+    train_meta_pair_tokens = int(os.environ.get("TRAIN_META_PAIR_TOKENS", "0"))
+    train_meta_start_tokens = int(os.environ.get("TRAIN_META_START_TOKENS", "-1"))
+    train_meta_end_tokens = int(os.environ.get("TRAIN_META_END_TOKENS", "-1"))
+    train_meta_start_ms = float(os.environ.get("TRAIN_META_START_MS", "-1"))
+    train_meta_end_ms = float(os.environ.get("TRAIN_META_END_MS", "-1"))
     train_meta_loss_a_weight = float(os.environ.get("TRAIN_META_LOSS_A_WEIGHT", 0.2))
     train_meta_loss_b_weight = float(os.environ.get("TRAIN_META_LOSS_B_WEIGHT", 0.8))
     train_meta_same_shard = bool(int(os.environ.get("TRAIN_META_SAME_SHARD", 1)))
@@ -229,6 +234,11 @@ class Hyperparameters:
         self.train_meta_steps = int(os.environ.get("TRAIN_META_STEPS", 1))
         self.train_meta_first_order = bool(int(os.environ.get("TRAIN_META_FIRST_ORDER", 1)))
         self.train_meta_min_seqs_per_side = int(os.environ.get("TRAIN_META_MIN_SEQS_PER_SIDE", 4))
+        self.train_meta_pair_tokens = int(os.environ.get("TRAIN_META_PAIR_TOKENS", "0"))
+        self.train_meta_start_tokens = int(os.environ.get("TRAIN_META_START_TOKENS", "-1"))
+        self.train_meta_end_tokens = int(os.environ.get("TRAIN_META_END_TOKENS", "-1"))
+        self.train_meta_start_ms = float(os.environ.get("TRAIN_META_START_MS", "-1"))
+        self.train_meta_end_ms = float(os.environ.get("TRAIN_META_END_MS", "-1"))
         self.train_meta_loss_a_weight = float(os.environ.get("TRAIN_META_LOSS_A_WEIGHT", 0.2))
         self.train_meta_loss_b_weight = float(os.environ.get("TRAIN_META_LOSS_B_WEIGHT", 0.8))
         self.train_meta_same_shard = bool(int(os.environ.get("TRAIN_META_SAME_SHARD", 1)))
@@ -312,10 +322,15 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "TRAIN_META_FIRST_ORDER",
     "TRAIN_META_LOSS_A_WEIGHT",
     "TRAIN_META_LOSS_B_WEIGHT",
+    "TRAIN_META_END_MS",
+    "TRAIN_META_END_TOKENS",
     "TRAIN_META_MIN_SEQS_PER_SIDE",
     "TRAIN_META_MODE",
+    "TRAIN_META_PAIR_TOKENS",
     "TRAIN_META_SAME_SHARD",
+    "TRAIN_META_START_MS",
     "TRAIN_META_START_FRAC",
+    "TRAIN_META_START_TOKENS",
     "TRAIN_META_STEPS",
     "TRAIN_SEQ_LEN",
     "USE_COMPILE",
@@ -1634,6 +1649,14 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError(
             f"TRAIN_META_MIN_SEQS_PER_SIDE must be positive, got {args.train_meta_min_seqs_per_side}"
         )
+    if args.train_meta_pair_tokens < 0:
+        raise ValueError(f"TRAIN_META_PAIR_TOKENS must be non-negative, got {args.train_meta_pair_tokens}")
+    if args.train_meta_start_tokens < -1 or args.train_meta_end_tokens < -1:
+        raise ValueError(
+            "TRAIN_META_START_TOKENS and TRAIN_META_END_TOKENS must be -1 (unset) or non-negative"
+        )
+    if args.train_meta_start_ms < -1.0 or args.train_meta_end_ms < -1.0:
+        raise ValueError("TRAIN_META_START_MS and TRAIN_META_END_MS must be -1 (unset) or non-negative")
     if args.train_meta_loss_a_weight < 0.0 or args.train_meta_loss_b_weight < 0.0:
         raise ValueError(
             "TRAIN_META_LOSS_A_WEIGHT and TRAIN_META_LOSS_B_WEIGHT must be non-negative, "
@@ -1676,7 +1699,21 @@ def main(argv: list[str] | None = None) -> None:
             f"(got TRAIN_BATCH_TOKENS={args.train_batch_tokens})"
         )
     local_train_tokens = args.train_batch_tokens // (world_size * grad_accum_steps)
-    meta_pair_tokens = max(local_train_tokens // 2, args.train_meta_min_seqs_per_side * args.train_seq_len)
+    min_meta_pair_tokens = args.train_meta_min_seqs_per_side * args.train_seq_len
+    if args.train_meta_pair_tokens > 0:
+        meta_pair_tokens = args.train_meta_pair_tokens
+    else:
+        meta_pair_tokens = max(local_train_tokens // 2, min_meta_pair_tokens)
+    if meta_pair_tokens < min_meta_pair_tokens:
+        raise ValueError(
+            f"TRAIN_META_PAIR_TOKENS must be at least {min_meta_pair_tokens} tokens for "
+            f"TRAIN_META_MIN_SEQS_PER_SIDE={args.train_meta_min_seqs_per_side} and TRAIN_SEQ_LEN={args.train_seq_len}, "
+            f"got {meta_pair_tokens}"
+        )
+    if meta_pair_tokens % args.train_seq_len != 0:
+        raise ValueError(
+            f"TRAIN_META_PAIR_TOKENS={meta_pair_tokens} must be divisible by TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
     meta_local_tokens = 2 * meta_pair_tokens
     if args.use_fast_adapters and args.train_meta_every > 0 and local_train_tokens % args.train_seq_len != 0:
         raise ValueError(
@@ -1901,6 +1938,26 @@ def main(argv: list[str] | None = None) -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     if args.use_fast_adapters:
+        if args.train_meta_start_tokens >= 0 or args.train_meta_end_tokens >= 0:
+            meta_schedule_desc = (
+                f"tokens start:{max(args.train_meta_start_tokens, 0)} "
+                f"end:{args.train_meta_end_tokens if args.train_meta_end_tokens >= 0 else 'inf'}"
+            )
+        elif args.train_meta_start_ms >= 0.0 or args.train_meta_end_ms >= 0.0:
+            meta_schedule_desc = (
+                f"ms start:{max(args.train_meta_start_ms, 0.0):.0f} "
+                f"end:{args.train_meta_end_ms if args.train_meta_end_ms >= 0.0 else 'inf'}"
+            )
+        elif args.max_wallclock_seconds > 0:
+            meta_schedule_desc = (
+                f"wallclock_frac start:{args.train_meta_start_frac:.3f} "
+                f"end:{args.train_meta_end_frac:.3f}"
+            )
+        else:
+            meta_schedule_desc = (
+                f"step_frac start:{args.train_meta_start_frac:.3f} "
+                f"end:{args.train_meta_end_frac:.3f}"
+            )
         log0(
             f"fast_gate_init:{args.fast_gate_init:.4f} "
             f"meta_pair_tokens:{meta_pair_tokens} meta_local_tokens:{meta_local_tokens} "
@@ -1910,6 +1967,7 @@ def main(argv: list[str] | None = None) -> None:
         if args.train_meta_every > 0 and args.train_meta_steps > 0:
             log0(
                 f"train_meta_mode:{args.train_meta_mode} "
+                f"train_meta_schedule:{meta_schedule_desc} "
                 f"train_meta_loss_a_weight:{args.train_meta_loss_a_weight:.4f} "
                 f"train_meta_loss_b_weight:{args.train_meta_loss_b_weight:.4f}"
             )
@@ -1944,6 +2002,26 @@ def main(argv: list[str] | None = None) -> None:
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+    def schedule_progress(step: int, elapsed_ms: float) -> float:
+        if max_wallclock_ms is not None:
+            return elapsed_ms / max(max_wallclock_ms, 1e-9)
+        return step / max(args.iterations, 1)
+
+    def meta_phase_is_active(step: int, elapsed_ms: float) -> bool:
+        if not args.use_fast_adapters:
+            return False
+        processed_tokens = step * args.train_batch_tokens
+        if args.train_meta_start_tokens >= 0 or args.train_meta_end_tokens >= 0:
+            start_tokens = max(args.train_meta_start_tokens, 0)
+            end_tokens = math.inf if args.train_meta_end_tokens < 0 else args.train_meta_end_tokens
+            return start_tokens <= processed_tokens < end_tokens
+        if args.train_meta_start_ms >= 0.0 or args.train_meta_end_ms >= 0.0:
+            start_ms = max(args.train_meta_start_ms, 0.0)
+            end_ms = math.inf if args.train_meta_end_ms < 0.0 else args.train_meta_end_ms
+            return start_ms <= elapsed_ms < end_ms
+        progress = schedule_progress(step, elapsed_ms)
+        return args.train_meta_start_frac <= progress < args.train_meta_end_frac
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -2020,19 +2098,14 @@ def main(argv: list[str] | None = None) -> None:
                 )
             break
 
-        progress = step / max(args.iterations, 1)
-        meta_phase_active = (
-            args.use_fast_adapters
-            and args.train_meta_start_frac <= progress < args.train_meta_end_frac
-        )
+        progress = schedule_progress(step, elapsed_ms := training_time_ms + 1000.0 * (time.perf_counter() - t0))
+        meta_phase_active = meta_phase_is_active(step, elapsed_ms)
         meta_active = (
             meta_phase_active
             and args.train_meta_every > 0
             and args.train_meta_steps > 0
             and (step % args.train_meta_every == 0)
         )
-
-        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         qat_active = args.use_projection_qat and (elapsed_ms >= args.qat_start_ms)
         compression_reg_active = (
             args.compression_reg_weight > 0.0
