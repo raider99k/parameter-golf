@@ -60,8 +60,10 @@ class Hyperparameters:
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    val_loss_every_seconds = float(os.environ.get("VAL_LOSS_EVERY_SECONDS", "0"))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     validate_at_step_zero = bool(int(os.environ.get("VALIDATE_AT_STEP_ZERO", "0")))
+    restore_best_val_checkpoint = bool(int(os.environ.get("RESTORE_BEST_VAL_CHECKPOINT", "0")))
 
     use_projection_qat = bool(int(os.environ.get("USE_PROJECTION_QAT", "0")))
     qat_start_ms = float(os.environ.get("QAT_START_MS", 540000.0))
@@ -165,8 +167,10 @@ class Hyperparameters:
 
         # Validation cadence and batch size. Validation always uses the full fineweb_val split.
         self.val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+        self.val_loss_every_seconds = float(os.environ.get("VAL_LOSS_EVERY_SECONDS", "0"))
         self.train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
         self.validate_at_step_zero = bool(int(os.environ.get("VALIDATE_AT_STEP_ZERO", "0")))
+        self.restore_best_val_checkpoint = bool(int(os.environ.get("RESTORE_BEST_VAL_CHECKPOINT", "0")))
 
         self.use_projection_qat = bool(int(os.environ.get("USE_PROJECTION_QAT", "0")))
         self.qat_start_ms = float(os.environ.get("QAT_START_MS", 540000.0))
@@ -307,6 +311,7 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "QAT_START_MS",
     "QK_GAIN_INIT",
     "RANK",
+    "RESTORE_BEST_VAL_CHECKPOINT",
     "ROPE_BASE",
     "RUN_ID",
     "SCALAR_LR",
@@ -339,6 +344,7 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "USE_PROJECTION_QAT",
     "VALIDATE_AT_STEP_ZERO",
     "VAL_LOSS_EVERY",
+    "VAL_LOSS_EVERY_SECONDS",
     "VAL_TOKENS_LIMIT",
     "VOCAB_SIZE",
     "WARMDOWN_ITERS",
@@ -1664,6 +1670,8 @@ def main(argv: list[str] | None = None) -> None:
         )
     if args.eval_score <= 0:
         raise ValueError(f"EVAL_SCORE must be positive, got {args.eval_score}")
+    if args.val_loss_every_seconds < 0:
+        raise ValueError(f"VAL_LOSS_EVERY_SECONDS must be non-negative, got {args.val_loss_every_seconds}")
     if not 0.0 <= args.compression_reg_start_frac <= 1.0:
         raise ValueError(
             f"COMPRESSION_REG_START_FRAC must be in [0, 1], got {args.compression_reg_start_frac}"
@@ -2059,16 +2067,30 @@ def main(argv: list[str] | None = None) -> None:
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
+    val_interval_ms = args.val_loss_every_seconds * 1000.0 if args.val_loss_every_seconds > 0 else None
+    next_val_ms = val_interval_ms
+    best_val_loss: float | None = None
+    best_val_bpb: float | None = None
+    best_val_step: int | None = None
+    best_val_train_time_ms: float | None = None
+    best_state_dict: dict[str, torch.Tensor] | None = None
 
     step = 0
     while True:
+        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        should_validate = last_step or (
+        should_validate_by_step = (
             args.val_loss_every > 0
             and (args.validate_at_step_zero or step > 0)
             and step % args.val_loss_every == 0
         )
+        should_validate_by_time = (
+            next_val_ms is not None
+            and (args.validate_at_step_zero or step > 0)
+            and elapsed_ms >= next_val_ms
+        )
+        should_validate = last_step or should_validate_by_step or should_validate_by_time
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
@@ -2087,6 +2109,23 @@ def main(argv: list[str] | None = None) -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if best_val_bpb is None or val_bpb < best_val_bpb:
+                best_val_loss = val_loss
+                best_val_bpb = val_bpb
+                best_val_step = step
+                best_val_train_time_ms = training_time_ms
+                if args.restore_best_val_checkpoint:
+                    best_state_dict = {
+                        name: tensor.detach().cpu().clone()
+                        for name, tensor in base_model.state_dict().items()
+                    }
+                log0(
+                    f"best_val_update step:{step}/{args.iterations} val_loss:{val_loss:.4f} "
+                    f"val_bpb:{val_bpb:.4f} train_time:{training_time_ms:.0f}ms"
+                )
+            if next_val_ms is not None:
+                while next_val_ms <= training_time_ms:
+                    next_val_ms += val_interval_ms
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -2228,6 +2267,17 @@ def main(argv: list[str] | None = None) -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if best_val_bpb is not None:
+        log0(
+            f"best_val_summary step:{best_val_step}/{args.iterations} val_loss:{best_val_loss:.4f} "
+            f"val_bpb:{best_val_bpb:.4f} train_time:{best_val_train_time_ms:.0f}ms"
+        )
+    if args.restore_best_val_checkpoint and best_state_dict is not None:
+        base_model.load_state_dict(best_state_dict, strict=True)
+        log0(
+            f"restored_best_val_checkpoint step:{best_val_step}/{args.iterations} "
+            f"train_time:{best_val_train_time_ms:.0f}ms"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
