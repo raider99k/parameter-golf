@@ -233,23 +233,85 @@ Best single observed scaled run so far:
 - float `2.4752`
 - final int8 `2.4769`
 
-## Current A5000 Main Line
+## Larger-Jump Scaling Waves
 
-The A5000 main line is now the scaled competitive recipe:
+After `4L 160d e128` was validated across seeds, the search switched to aggressive single-seed scaling on `SEED=3407` only.
+
+### Jump wave 1
+
+| Variant | Params | Float `val_bpb` | Final int8 `val_bpb` | Total submission size int8+zlib |
+|---|---:|---:|---:|---:|
+| `6L 224d e160` | `714,004` | `2.4165` | `2.4167` | `864,865` bytes |
+| `5L 256d e192` | `913,684` | `2.3931` | `2.3947` | `972,133` bytes |
+| `6L 256d e192` | `915,476` | `2.3890` | `2.3873` | `1,077,445` bytes |
+
+Interpretation:
+
+- scaling was still paying strongly
+- width was the strongest clean lever in this regime
+- `6L 256d e192` became the new single-seed best line
+
+### Jump wave 2
+
+| Variant | Params | Float `val_bpb` | Final int8 `val_bpb` | Total submission size int8+zlib |
+|---|---:|---:|---:|---:|
+| `8L 256d e192` | `917,556` | `2.4244` | `2.4254` | `1,285,076` bytes |
+| `6L 320d e224` | `1,342,996` | `2.3583` | `2.3624` | `1,453,922` bytes |
+| `8L 320d e224` | `1,347,156` | `2.3863` | `2.3882` | `1,770,524` bytes |
+
+Interpretation:
+
+- width still paid clearly
+- plain extra depth under `2x1` sharing regressed twice
+- `6L 320d e224` became the next best line
+
+### Jump wave 3
+
+| Variant | Params | Float `val_bpb` | Final int8 `val_bpb` | Total submission size int8+zlib |
+|---|---:|---:|---:|---:|
+| `6L 384d e288` | `1,901,588` | `2.3544` | `2.3541` | `2,004,816` bytes |
+| `6L 320d e224`, `MLP_MULT=3` | `1,548,436` | `2.3553` | `2.3598` | `1,737,004` bytes |
+| `8L 320d e224`, `4x2` | `2,375,013` | `2.3622` | `2.3624` | `1,985,013` bytes |
+
+Interpretation:
+
+- width remained the best immediate lever
+- `MLP_MULT=3` started to matter in the larger-width regime
+- ratio-preserving uniqueness scaling (`4x2`) rescued deep `8L` substantially versus plain `2x1`
+- but `8L 320d e224 4x2` still did not beat the width-led `6L` line
+
+### Final Ampere wave
+
+| Variant | Params | Float `val_bpb` | Final int8 `val_bpb` | Total submission size int8+zlib |
+|---|---:|---:|---:|---:|
+| `6L 384d e288`, `MLP_MULT=3` | `2,197,268` | `2.3273` | `2.3290` | `2,411,468` bytes |
+| `6L 448d e320` | `2,503,188` | `2.3391` | `2.3397` | `2,612,703` bytes |
+| `8L 384d e288`, `4x2` | `3,385,765` | `2.3279` | `2.3299` | `2,758,014` bytes |
+
+Interpretation:
+
+- `MLP_MULT=3` became fully competitive once width reached `384d`
+- pure width scaling from `384d` to `448d` still helped, but less than adding a larger MLP at `384d`
+- depth with ratio-preserving uniqueness (`8L 384d e288 4x2`) became a serious branch again
+- however, on the final A5000 wave it still lost narrowly to `6L 384d e288 MLP_MULT=3`
+
+## Final A5000 Best Line
+
+The best A5000 single-seed run before moving off Ampere is:
 
 ```bash
-RUN_ID=competitive_static_B_s3407_4L_160d_e128 \
+RUN_ID=competitive_jump_J_s3407_6L_384d_e288_mlp3 \
 DATA_PATH=./data/datasets/fineweb10B_sp1024 \
 TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
 SEED=3407 \
 VOCAB_SIZE=1024 \
-NUM_LAYERS=4 \
+NUM_LAYERS=6 \
 NUM_UNIQUE_ATTN=2 \
 NUM_UNIQUE_MLP=1 \
-MODEL_DIM=160 \
+MODEL_DIM=384 \
 NUM_HEADS=4 \
 NUM_KV_HEADS=2 \
-MLP_MULT=2 \
+MLP_MULT=3 \
 USE_FAST_ADAPTERS=1 \
 FAST_RANK=2 \
 FAST_GRAD_CLIP=0.1 \
@@ -276,7 +338,7 @@ VAL_TOKENS_LIMIT=2048 \
 EVAL_ADAPT=256 \
 EVAL_SCORE=64 \
 USE_FACTOR_EMBED=1 \
-EMBED_DIM=128 \
+EMBED_DIM=288 \
 TIED_EMBED_LR=0.001 \
 MATRIX_LR=0.03 \
 SCALAR_LR=0.04 \
@@ -284,6 +346,13 @@ GRAD_CLIP_NORM=1.0 \
 USE_COMPILE=0 \
 python train_gpt_competitive.py
 ```
+
+Best observed result on A5000:
+
+- params: `2,197,268`
+- float `val_bpb`: `2.3273`
+- final int8 roundtrip `val_bpb`: `2.3290`
+- total submission size int8+zlib: `2,411,468` bytes
 
 ## Current Conclusions
 
@@ -298,24 +367,40 @@ python train_gpt_competitive.py
 5. The current extreme implementations are not ready for promotion on the current regime:
    - parity is fixed
    - all tested variants are still worse than the incumbent
-6. Scaling is now the dominant source of improvement:
-   - `4L 160d e128` clearly beats the old `2L 128d e96` incumbent
-   - the gain is repeatable across `1337`, `2024`, and `3407`
-7. Compression is still not the primary bottleneck:
-   - the new scaled main line is still only about `451 KB` int8+zlib
-   - this is far below the `16 MB` competition cap
-8. The next serious path is therefore:
+6. Scaling was the dominant source of A5000 improvement:
+   - `4L 160d e128` clearly beat the old `2L 128d e96` incumbent
+   - larger single-seed waves kept improving all the way to `6L 384d e288 MLP_MULT=3`
+7. Width was the strongest and most reliable scaling lever on A5000:
+   - `d` increases repeatedly improved results
+   - `e` worked best as a lagging bottleneck-relief term rather than a 1:1 match to `d`
+8. Plain extra depth under `2x1` sharing eventually saturated:
+   - `8L` with plain `2x1` regressed in multiple comparisons
+   - deeper models needed either more uniqueness or a different scaling axis to stay competitive
+9. Ratio-preserving uniqueness scaling became relevant in the larger regime:
+   - `8L 320d e224 4x2` strongly improved over `8L 320d e224 2x1`
+   - `8L 384d e288 4x2` nearly matched the final best line
+10. `MLP_MULT=3` was not critical early, but became a serious lever once width reached the `320d-384d` regime:
+   - `6L 384d e288 MLP_MULT=3` is the final A5000 best line
+11. Compression is still not the primary bottleneck:
+   - even the final A5000 best line is only about `2.41 MB` int8+zlib
+   - this is still far below the `16 MB` competition cap
+12. A5000 memory is also not the main bottleneck at the current training setup:
+   - peak allocated memory stayed in the low hundreds of MiB
+   - search throughput, not VRAM, became the practical bottleneck on Ampere
+13. The next serious path after A5000 is therefore:
+   - move to faster hardware
    - continue scaling from `train_gpt_competitive.py`
-   - keep the same `2x1` sharing philosophy unless scaling disproves it
-   - use `train_gpt_extreme.py` only as a future ablation branch for larger-model regimes
+   - carry forward the current best A5000 line as the base recipe
+   - keep `train_gpt_extreme.py` only as a future ablation branch for larger-model regimes
 
 ## Recommended Next Step
 
 The most defensible next move after these A5000 runs is:
 
-1. treat `4L 160d e128` as the new A5000 main line
-2. continue probing nearby scaled variants from `train_gpt_competitive.py`
-3. stop spending GPU time on the current extreme features in the tiny-model regime
-4. only revisit the dormant extreme hooks after scaling creates a new optimization bottleneck
+1. treat `6L 384d e288 MLP_MULT=3` as the final A5000 base line
+2. move to faster hardware, because A5000 step time is now the practical search bottleneck
+3. continue scaling from `train_gpt_competitive.py`
+4. keep using single-seed scaling search until a clearly better line emerges, then promote with larger-val and seed checks
+5. revisit dormant extreme hooks only if the next hardware phase exposes a new optimization bottleneck
 
 If a local testing helper is kept, it should point first to the incumbent path and only secondarily to the extreme branch.
