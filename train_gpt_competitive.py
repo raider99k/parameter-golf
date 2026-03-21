@@ -75,6 +75,7 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", "0"))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -174,6 +175,7 @@ class Hyperparameters:
         self.warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
         self.train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
         self.train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+        self.grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", "0"))
         self.max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
         self.qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -264,6 +266,7 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "FAST_GATE_INIT",
     "FAST_RANK",
     "GRAD_CLIP_NORM",
+    "GRAD_ACCUM_STEPS",
     "HEAD_LR",
     "INT8_FORCE_QUANTIZE_NAME_PATTERNS",
     "INT8_KEEP_FLOAT_MAX_NUMEL",
@@ -1655,14 +1658,22 @@ def main(argv: list[str] | None = None) -> None:
     distributed = world_size > 1 and "RANK" in os.environ and "WORLD_SIZE" in os.environ
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    if args.grad_accum_steps > 0:
+        grad_accum_steps = args.grad_accum_steps
+    else:
+        if 8 % world_size != 0:
+            raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so auto grad_accum_steps stays integral")
+        grad_accum_steps = 8 // world_size
+    if grad_accum_steps <= 0:
+        raise ValueError(f"GRAD_ACCUM_STEPS must be positive, got {grad_accum_steps}")
     if args.train_batch_tokens <= 0 or args.train_seq_len <= 0:
         raise ValueError("TRAIN_BATCH_TOKENS and TRAIN_SEQ_LEN must be positive")
-    if args.train_batch_tokens % (8 * args.train_seq_len) != 0:
+    global_step_tokens = world_size * grad_accum_steps * args.train_seq_len
+    if args.train_batch_tokens % global_step_tokens != 0:
         raise ValueError(
-            f"TRAIN_BATCH_TOKENS={args.train_batch_tokens} must be divisible by 8 * TRAIN_SEQ_LEN={args.train_seq_len}"
+            "TRAIN_BATCH_TOKENS must be divisible by "
+            f"WORLD_SIZE * GRAD_ACCUM_STEPS * TRAIN_SEQ_LEN = {world_size} * {grad_accum_steps} * {args.train_seq_len} "
+            f"(got TRAIN_BATCH_TOKENS={args.train_batch_tokens})"
         )
     local_train_tokens = args.train_batch_tokens // (world_size * grad_accum_steps)
     meta_pair_tokens = max(local_train_tokens // 2, args.train_meta_min_seqs_per_side * args.train_seq_len)
