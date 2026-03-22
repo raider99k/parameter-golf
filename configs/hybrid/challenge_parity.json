@@ -1,0 +1,34 @@
+{
+  "run": {
+    "id": "challenge_parity",
+    "stage": "submission_candidate"
+  },
+  "data": {
+    "val_tokens_limit": 0
+  },
+  "experts": {
+    "enable_ngram": false,
+    "enable_pointer": false,
+    "enable_doc_bias": true
+  },
+  "adaptation": {
+    "meta_enabled": false,
+    "strict_commit_steps": 0,
+    "exploratory_prefix_steps": 0,
+    "exploratory_persist_across_docs": false
+  },
+  "eval": {
+    "policy": "strict_causal",
+    "score_tokens": 1024,
+    "adapt_tokens": 3072,
+    "window_tokens": 0,
+    "documentwise": false,
+    "adaptive_extra_pass": false,
+    "write_block_logs": false
+  },
+  "export": {
+    "write_after_train": true,
+    "artifact_budget_bytes": 16777216,
+    "fail_if_over_budget": true
+  }
+}

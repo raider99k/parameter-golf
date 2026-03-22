@@ -462,3 +462,12 @@ If it answers none of those, it is not on the critical path to submission.
 Additional rule for experiment hygiene:
 
 - if a run is not wallclock-capped, it is not allowed to decide the final submission recipe by itself
+
+## Challenge-Parity Eval
+
+The repository now includes:
+
+- [challenge_parity.json](/c:/Users/pasqu/OpenChallenge/parameter-golf/configs/hybrid/challenge_parity.json)
+- [CHALLENGE_PARITY_CHECKLIST.md](/c:/Users/pasqu/OpenChallenge/parameter-golf/CHALLENGE_PARITY_CHECKLIST.md)
+
+These define the minimum standard for treating a `hybrid_golf` result as challenge-ready rather than merely proxy-valid.
