@@ -23,6 +23,48 @@ As of **March 22, 2026**:
 
 This means our internal results must be interpreted against the live frontier, not only the accepted leaderboard.
 
+## Current Repo State
+
+The historical run notes below are still useful, but they no longer fully describe what is implemented in `hybrid_golf`.
+
+Current live code state:
+
+- first-wave mainline acceleration is landed:
+  - decimal `submission_total` accounting
+  - factorized tied embeddings
+  - attention / MLP bank sharing
+  - NormFormer-lite
+  - depth-aware initialization
+  - Muon split optimizer
+  - SWA-style averaging
+  - projection-QAT
+  - compression regularization
+  - mixed-bit export (`mixed_v1`)
+
+- second-wave acceleration is landed:
+  - recurrent shared-stack depth
+  - pass gates / pass modulation / pass q-gain
+  - low-rank block deltas / logit delta
+  - BitLinear / ternary latent weights
+  - `mixed_v2` export for ternary latent tensors
+  - config inheritance via `extends`
+  - branch presets for:
+    - Stage 0 root selection
+    - recurrent branch
+    - BitLinear branch
+    - `doc_bias` parity overlays
+
+- what is still not done:
+  - automatic Stage 0 winner selection
+  - automatic finalist advancement
+  - final single-file submission condensation
+  - repeat-run / significance harness
+
+Interpretation:
+
+- the toolkit is real and materially stronger than the historical proxy-era branch
+- the next bottleneck is honest remote ranking of the landed presets, not another blind implementation spree
+
 ## What We Implemented
 
 ### Core toolkit
@@ -30,12 +72,22 @@ This means our internal results must be interpreted against the live frontier, n
 Implemented under `hybrid_golf/`:
 
 - config loading and dotted overrides
+- config inheritance via `extends`
 - shard loading and byte-accounting-compatible tokenization
 - GPT training and evaluation
 - strict and exploratory policies
 - `ngram`, `pointer`, and `doc_bias` experts
 - writable-state adaptation / fast-weight path
-- quantized export and roundtrip reload
+- factorized tied embeddings
+- attention / MLP bank sharing
+- NormFormer-lite and depth-aware init
+- Muon split optimizer
+- SWA-style averaging
+- projection-QAT and compression regularization
+- recurrent shared-stack depth with pass controls
+- low-rank recurrent deltas / logit delta
+- BitLinear / ternary latent weights
+- mixed-bit quantized export and roundtrip reload
 - CLI entrypoints for train / eval / sweep
 
 Main files:
@@ -55,8 +107,17 @@ Main files:
 
 - [configs/hybrid/tiny_strict.json](c:\Users\pasqu\OpenChallenge\parameter-golf\configs\hybrid\tiny_strict.json)
 - [configs/hybrid/tiny_exploratory.json](c:\Users\pasqu\OpenChallenge\parameter-golf\configs\hybrid\tiny_exploratory.json)
+- [configs/hybrid/challenge_mainline_base.json](c:\Users\pasqu\OpenChallenge\parameter-golf\configs\hybrid\challenge_mainline_base.json)
+- [configs/hybrid/challenge_mainline_shared.json](c:\Users\pasqu\OpenChallenge\parameter-golf\configs\hybrid\challenge_mainline_shared.json)
+- [configs/hybrid/challenge_mainline_shared_qat.json](c:\Users\pasqu\OpenChallenge\parameter-golf\configs\hybrid\challenge_mainline_shared_qat.json)
+- [configs/hybrid/challenge_mainline_recurrent.json](c:\Users\pasqu\OpenChallenge\parameter-golf\configs\hybrid\challenge_mainline_recurrent.json)
+- [configs/hybrid/challenge_mainline_recurrent_delta.json](c:\Users\pasqu\OpenChallenge\parameter-golf\configs\hybrid\challenge_mainline_recurrent_delta.json)
+- [configs/hybrid/challenge_mainline_bitlinear_mlp.json](c:\Users\pasqu\OpenChallenge\parameter-golf\configs\hybrid\challenge_mainline_bitlinear_mlp.json)
+- [configs/hybrid/challenge_mainline_bitlinear_full.json](c:\Users\pasqu\OpenChallenge\parameter-golf\configs\hybrid\challenge_mainline_bitlinear_full.json)
 - [configs/hybrid/challenge_parity.json](c:\Users\pasqu\OpenChallenge\parameter-golf\configs\hybrid\challenge_parity.json)
 - [configs/hybrid/challenge_parity_lite.json](c:\Users\pasqu\OpenChallenge\parameter-golf\configs\hybrid\challenge_parity_lite.json)
+- [configs/hybrid/challenge_parity_doc_bias.json](c:\Users\pasqu\OpenChallenge\parameter-golf\configs\hybrid\challenge_parity_doc_bias.json)
+- [configs/hybrid/challenge_parity_lite_doc_bias.json](c:\Users\pasqu\OpenChallenge\parameter-golf\configs\hybrid\challenge_parity_lite_doc_bias.json)
 - [ZERO_TO_SUBMISSION.md](c:\Users\pasqu\OpenChallenge\parameter-golf\ZERO_TO_SUBMISSION.md)
 - [CHALLENGE_PARITY_CHECKLIST.md](c:\Users\pasqu\OpenChallenge\parameter-golf\CHALLENGE_PARITY_CHECKLIST.md)
 
@@ -70,6 +131,21 @@ Main files:
 - `f698be5` Add challenge parity lite preset
 - `bf09406` Add frontier reality check to roadmap
 - `ad818ba` Fix eval preset overrides on checkpointed runs
+- `ebb1d8e` Accelerate hybrid golf second wave
+
+## Current protocol
+
+The current mainline protocol is no longer:
+
+- `strict + doc_bias` by default
+
+The current mainline protocol is:
+
+1. rank static priors with `doc_bias` off
+2. use `challenge_parity_lite` for the broad ranking pass
+3. use `challenge_parity` only on the top 1-2 candidates
+4. re-test `doc_bias` exactly once on the single best static prior
+5. keep `pointer`, `ngram`, `meta`, and adaptive extra pass frozen unless the new winner justifies reopening them
 
 ## Key bugs and fixes
 

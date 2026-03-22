@@ -45,3 +45,26 @@ def test_load_config_file_supports_relative_extends(tmp_path):
     assert config["model"]["normformer_lite"] is True
     assert config["model"]["recurrent_passes"] == 2
     assert config["export"]["quant_scheme"] == "mixed_v2"
+
+
+def test_tianhao_size_preset_inherits_base_recipe():
+    config = load_config_file("configs/hybrid/challenge_mainline_base_tianhao_size.json")
+    assert config["run"]["id"] == "challenge_mainline_base_tianhao_size"
+    assert config["model"]["num_layers"] == 10
+    assert config["model"]["model_dim"] == 512
+    assert config["model"]["num_heads"] == 8
+    assert config["model"]["num_kv_heads"] == 4
+    assert config["model"]["mlp_mult"] == 3.0
+    assert config["train"]["optimizer"] == "adamw"
+    assert config["export"]["budget_mode"] == "submission_total"
+
+
+def test_tianhao_fit_preset_stays_close_but_reduces_width():
+    config = load_config_file("configs/hybrid/challenge_mainline_base_tianhao_fit.json")
+    assert config["run"]["id"] == "challenge_mainline_base_tianhao_fit"
+    assert config["model"]["num_layers"] == 10
+    assert config["model"]["model_dim"] == 496
+    assert config["model"]["embed_dim"] == 496
+    assert config["model"]["num_heads"] == 8
+    assert config["model"]["num_kv_heads"] == 4
+    assert config["model"]["mlp_mult"] == 3.0

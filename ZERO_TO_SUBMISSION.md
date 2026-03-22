@@ -29,12 +29,13 @@ But it is also **not yet a challenge-faithful submission stack**.
 
 What is currently true:
 
-- the best surviving evaluator idea so far is `strict + doc_bias`
+- the default serious evaluator path is now `strict_causal` with `doc_bias` off
+- `doc_bias` is still the only hybrid feature allowed back onto the critical path, but only as a post-winner overlay
 - `pointer`, `ngram`, `meta`, and adaptive extra pass are currently off the winning path
 - capacity scaling is helping more than context scaling in the current proxy regime
-- we are **not yet enforcing the submission budget on every run**
-- we are **not yet running a frontier-strength static prior**
-- export is currently **int8 + zlib**, not a frontier-grade mixed-bit submission export
+- decimal submission-total budget accounting is now wired into serious runs
+- we now have a stronger static-prior stack in `hybrid_golf`, but it still needs real remote ranking runs
+- export now supports mixed-bit dense quantization and ternary BitLinear export, but final submission condensation is still missing
 
 ## Frontier Reality Check
 
@@ -135,35 +136,50 @@ Every serious branch must eventually satisfy all of these:
 ### Real and usable now
 
 - config loader with overrides
+- config inheritance via `extends`
 - challenge shard reader
 - tokenizer / byte-accounting layer
 - GPT model training and evaluation
 - strict and exploratory evaluator policies
 - ngram / pointer / doc_bias experts
 - writable-state adaptation
+- factorized tied embeddings
+- attention / MLP bank sharing
+- NormFormer-lite and depth-aware initialization
+- Muon split optimizer
+- SWA-style averaging
+- projection-QAT and compression regularization
+- recurrent shared-stack depth with pass controls and low-rank deltas
+- BitLinear / ternary latent weights
+- mixed-bit export (`mixed_v1` / `mixed_v2`)
+- submission-total budget accounting
 - roundtrip export / reload
 - checkpoint-aware eval config loading
 
 ### Implemented but still simplified
 
-- export:
-  current export is int8-centric and compressed with zlib
 - expert gate:
   heuristic and hand-tuned, not learned or calibrated
 - meta-training:
   present, but currently not on the winning path
 - recurrent adaptive compute:
-  present, but currently not on the winning path
+  present, but `adaptive_extra_pass` still only drives the older top-block path, not the full recurrent branch
+- branch selection workflow:
+  Stage 0 winner selection and branch advancement are still manual
+- submission packaging:
+  code-byte accounting is real, but final single-file condensation is not yet built
 
 ### Not implemented yet from the bigger submission vision
 
-- mixed-bit frontier export path (`int6` / `int5` / more selective precision allocation)
-- QAT / late-QAT
-- EMA / Tight SWA
-- stronger frontier architectural stack like partial RoPE / LN scaling / XSA-like additions
-- automatic artifact-budget enforcement on every serious run
-- systematic significance / repeat-run harness
+- automatic root selection from Stage 0 into the wave-2 branch matrix
+- systematic branch-ranking harness that advances only the top candidates
 - full submission condensation path into a final minimal artifact script
+- systematic significance / repeat-run harness
+- learned or calibrated expert gating
+- stronger frontier architectural branches beyond the current waves:
+  partial-RoPE / LN-scaling / XSA-like additions
+- optional hybrid revisits after the static-prior winner:
+  pointer, writable-state methods, or meta, but only if new evidence appears
 
 ## Incumbent Script Takeaways
 
@@ -237,39 +253,27 @@ What the extreme script explicitly confirms:
 - eval-time TTT is not on the mainline path
 - the more submission-relevant frontier is a stronger compact prior, not a looser evaluator
 
-## Prioritized Frontier Backlog
+## Prioritized Remaining Backlog
 
 Ordered by submission relevance, not by novelty:
 
-1. **Automatic budget accounting**
-   Every serious run must produce export bytes and roundtrip metrics.
+1. **Stage 0 and wave-2 ranking**
+   Run the already-landed branch matrix under parity-lite and full parity.
 
-2. **Export-aware static prior**
-   Bring over the competitive-script ideas:
-   - projection-QAT
-   - compression regularization
-   - selective precision retention
-   - stronger export accounting
+2. **Submission condensation**
+   Build the final minimal artifact path rather than counting the whole repo runtime forever.
 
-3. **Optimizer and embedding improvements**
-   Bring over:
-   - Muon optimizer split
-   - factorized tied embeddings
+3. **Repeatability / significance**
+   Add a proper rerun harness so candidate promotion is not based on one-off wins.
 
-4. **Compute-for-bytes backbone branch**
-   Explore one serious branch based on:
-   - partial attention / MLP sharing
-   - or recurrent shared-stack depth
+4. **Branch orchestration**
+   Automate winner selection and finalist advancement instead of relying on manual shell flows.
 
-5. **Advanced compression branch**
-   Explore:
-   - BitLinear / ternary latent weights
-   - more aggressive mixed-precision export
+5. **Hybrid re-open only after a winner exists**
+   Re-test `doc_bias` on the best static prior, then decide whether any other hybrid feature deserves another pass.
 
-6. **Hybrid additions on top**
-   Only after the stronger prior exists:
-   - re-test `doc_bias`
-   - then optionally revisit `pointer` or writable-state methods
+6. **Further frontier architecture only if needed**
+   Explore new compact-prior branches only after the current mainline stack is honestly ranked.
 
 ## Strategic Principle
 
@@ -300,19 +304,22 @@ Decision:
 
 - freeze the current clean evaluator baseline as:
   - `strict_causal`
-  - `doc_bias` enabled
+  - `doc_bias` disabled by default
   - `ngram` disabled
   - `pointer` disabled
   - `meta` disabled
   - `adaptive_extra_pass` disabled
 
-This is the default research baseline until something clearly beats it.
+After picking the best static prior, run exactly one overlay comparison:
+
+- base prior
+- base prior + `doc_bias`
 
 ## Phase 1: Make Every Serious Run Challenge-Aware
 
-Status: not complete
+Status: mostly complete
 
-Before scaling further, add the following:
+What is already in place:
 
 1. automatic export after every serious train run
 2. artifact-byte reporting in train/eval summaries
@@ -321,10 +328,6 @@ Before scaling further, add the following:
    - `smoke`
    - `proxy`
    - `submission_candidate`
-
-Why:
-
-Right now we are finding useful trends, but we are still under-enforcing the main contest constraint. That is dangerous.
 
 Deliverable:
 
@@ -342,9 +345,14 @@ Wallclock rule:
 - fixed-step runs are acceptable for rough `proxy` ranking only when they are clearly labeled as such
 - any run that influences submission decisions must be compared under an explicit wallclock cap, not only equal step counts
 
+Remaining work in this phase:
+
+- final submission condensation
+- a stricter automated run harness that picks winners instead of relying on manual command sequences
+
 ## Phase 2: Build A Challenge-Faithful Static Prior
 
-Status: not complete
+Status: first acceleration waves implemented, remote ranking pending
 
 This is the biggest missing piece.
 
@@ -352,30 +360,48 @@ We should not keep treating the current strict baseline as if it were frontier-l
 
 Goal:
 
-Implement enough of the modern frontier stack to get a **strong compact prior** under the 16 MB export budget.
+Use the already-landed mainline stack to get a **strong compact prior** under the 16 MB export budget, then rank the new branches under parity-lite and full parity.
 
-Priority order:
+Already implemented in `hybrid_golf`:
 
 1. stronger export path
    - mixed precision / mixed bit-width export
-   - better compression than current int8+zlib baseline
-   - competitive-script style selective keep-float and projection-aware export
+   - selective keep-float policy
+   - exact treatment of small / control tensors
 
 2. training-time robustness to export
-   - QAT or at least export-aware finetuning
-   - projection-QAT and compression regularization are the first concrete candidates
+   - projection-QAT
+   - compression regularization
 
-3. budget-aware capacity search
-   - measure quality as a function of exported bytes, not only model dimensions
-   - include factorized tied embeddings and optimizer-split variants
+3. budget-aware capacity controls
+   - factorized tied embeddings
+   - attention / MLP bank sharing
+   - Muon optimizer split
+   - SWA-style averaging
 
-4. compute-for-bytes architectural branch
-   - partial attention / MLP sharing
-   - or recurrent shared-stack depth from the extreme script
+4. compute-for-bytes architecture branches
+   - recurrent shared-stack depth
+   - pass modulation / q-gain
+   - low-rank block / logit deltas
 
-5. selected frontier features only if they are byte-efficient
-   - not "implement everything"
-   - prioritize depth-aware residual init, NormFormer-lite, and other cheap stabilizers before heavier branches
+5. advanced compression branch
+   - BitLinear / ternary latent weights
+   - `mixed_v2` export support
+
+What remains in this phase:
+
+1. run Stage 0 root selection on:
+   - `challenge_mainline_base`
+   - `challenge_mainline_shared`
+   - `challenge_mainline_shared_qat`
+
+2. rank wave-2 branches against that root:
+   - `challenge_mainline_recurrent`
+   - `challenge_mainline_recurrent_delta`
+   - `challenge_mainline_bitlinear_mlp`
+   - `challenge_mainline_bitlinear_full`
+
+3. advance only the top 1-2 static-prior candidates to full parity and export roundtrip
 
 Meaning:
 
@@ -384,23 +410,25 @@ But we **do** need a strong enough static prior that hybrid gains are measured o
 
 ## Phase 3: Re-test Hybrid Additions On Top Of The Strong Prior
 
-Status: blocked on Phase 2
+Status: partially blocked on branch ranking
 
 Only after the stronger prior exists should we revisit hybrid components.
 
-Order:
+Current order:
 
 1. `doc_bias`
-   - confirm it still buys residual BPB on top of a stronger static prior
+   - compare exactly once on the best static prior:
+     - base prior
+     - base prior + `doc_bias`
 
 2. `pointer`
-   - re-test only if there is reason to think local repetition still leaves useful entropy
+   - stay frozen unless the new winner leaves obvious repeat-structure on the table
 
 3. `ngram`
-   - low priority unless retuned and clearly motivated
+   - stay frozen unless there is new evidence
 
 4. writable-state adaptation
-   - only if it helps under `strict_causal`
+   - only revisit if it helps under `strict_causal`
    - exploratory-only gains do not count as progress toward submission
 
 Decision gate:
@@ -452,18 +480,19 @@ Until Phase 1 and Phase 2 are tighter, stop doing these by default:
 
 These are the highest-priority concrete tasks.
 
-1. Add automatic artifact export and byte reporting to serious runs.
-2. Make wallclock a first-class metric for serious runs.
-3. Define what counts as a `serious run` in config terms.
-4. Freeze the current clean baseline:
-   - strict
-   - doc_bias only
-   - no pointer
-   - no ngram
-   - no meta
-   - no adaptive extra pass
-5. Start the budget-aware static-prior phase instead of blind capacity scaling.
-6. Re-test hybrid additions only after the stronger prior exists.
+1. Run Stage 0 parity-lite ranking on:
+   - `challenge_mainline_base`
+   - `challenge_mainline_shared`
+   - `challenge_mainline_shared_qat`
+2. Freeze the winning static-prior root from that Stage 0 rerun.
+3. Run the wave-2 branch matrix:
+   - recurrent
+   - recurrent delta
+   - BitLinear MLP
+   - BitLinear full
+4. Advance only the best 1-2 static-prior candidates to full parity plus roundtrip.
+5. Re-test `doc_bias` only on the single best static prior.
+6. Update the docs and runbooks with the actual winner once the ranking is real.
 
 ## Current Baseline To Beat
 
@@ -472,13 +501,13 @@ Internal research baseline right now:
 - model family: strict baseline branch
 - evaluator:
   - `strict_causal`
-  - `doc_bias` enabled
+  - `doc_bias` disabled by default
   - `ngram` disabled
   - `pointer` disabled
   - `meta` disabled
   - `adaptive_extra_pass` disabled
 
-Best observed serious proxy result so far:
+Best observed historical serious proxy result so far:
 
 - `ada_proxy12x384_seq512_w540`
 - `val_bpb = 1.7747509821863527`
@@ -487,9 +516,9 @@ Best observed serious proxy result so far:
 
 Current perspective:
 
-- this is our best internal serious-proxy baseline
+- this is our best historical serious-proxy baseline under the old reduced-slice regime
 - it is still far from the live non-TTT frontier at `1.1233`
-- the remaining gap is too large to justify complacency
+- it should no longer decide the mainline recipe without parity-lite reranking on the new stack
 
 ## Final Rule
 

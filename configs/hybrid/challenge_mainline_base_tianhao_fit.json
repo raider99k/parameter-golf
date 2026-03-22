@@ -1,0 +1,10 @@
+{
+  "extends": "challenge_mainline_base_tianhao_size.json",
+  "run": {
+    "id": "challenge_mainline_base_tianhao_fit"
+  },
+  "model": {
+    "model_dim": 496,
+    "embed_dim": 496
+  }
+}

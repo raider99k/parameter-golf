@@ -30,6 +30,21 @@ def _progress_frac(step: int, total_steps: int) -> float:
     return min((step + 1) / max(total_steps, 1), 1.0)
 
 
+def _schedule_progress_frac(
+    step: int,
+    total_steps: int,
+    elapsed_seconds: float,
+    max_wallclock_seconds: float,
+) -> float:
+    step_progress = _progress_frac(step, total_steps)
+    if max_wallclock_seconds <= 0:
+        return step_progress
+    wallclock_progress = min(max(elapsed_seconds, 0.0) / max_wallclock_seconds, 1.0)
+    # When runs are capped by wallclock, late-phase schedules should track
+    # the budget actually consumed rather than the unreachable iteration cap.
+    return max(step_progress, wallclock_progress)
+
+
 def _should_write_artifact_after_train(config: dict[str, object]) -> bool:
     if bool(config["export"]["write_after_train"]):
         return True
@@ -160,7 +175,12 @@ def run_training(config: dict[str, object]) -> dict[str, object]:
         if max_wallclock_seconds > 0 and elapsed >= max_wallclock_seconds:
             logger.log(f"wallclock_stop step={step}")
             break
-        progress = _progress_frac(step, int(config["train"]["iterations"]))
+        progress = _schedule_progress_frac(
+            step,
+            int(config["train"]["iterations"]),
+            elapsed,
+            max_wallclock_seconds,
+        )
         lr_scale = _lr_scale(step, int(config["train"]["warmup_steps"]))
         qat_active = bool(config["train"]["projection_qat_enabled"]) and progress >= float(config["train"]["qat_start_frac"])
         if qat_active:

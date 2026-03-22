@@ -1,0 +1,20 @@
+{
+  "extends": "challenge_mainline_base.json",
+  "run": {
+    "id": "challenge_mainline_base_tianhao_size"
+  },
+  "model": {
+    "num_layers": 10,
+    "model_dim": 512,
+    "num_heads": 8,
+    "num_kv_heads": 4,
+    "mlp_mult": 3.0,
+    "tie_embeddings": true,
+    "use_factor_embed": false,
+    "embed_dim": 512,
+    "num_unique_attn": 0,
+    "num_unique_mlp": 0,
+    "normformer_lite": false,
+    "depth_aware_init": false
+  }
+}
