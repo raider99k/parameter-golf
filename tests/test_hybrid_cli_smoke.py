@@ -73,7 +73,7 @@ def write_config(path: Path, train_glob: str, val_glob: str, tokenizer_path: str
 def write_eval_config_with_wrong_model_dims(path: Path, train_glob: str, val_glob: str, tokenizer_path: str, output_root: str) -> None:
     config = {
         "run": {"id": "cli_smoke_eval_mismatch", "output_root": output_root, "device": "cpu"},
-        "data": {"train_glob": train_glob, "val_glob": val_glob, "val_tokens_limit": 0},
+        "data": {"train_glob": train_glob, "val_glob": val_glob, "val_tokens_limit": 6},
         "tokenizer": {"path": tokenizer_path, "kind": "pure_byte", "bos_id": 1, "eos_id": 2},
         "model": {
             "vocab_size": 260,
@@ -90,9 +90,9 @@ def write_eval_config_with_wrong_model_dims(path: Path, train_glob: str, val_glo
             "recurrent_top_block": False,
         },
         "train": {"enabled": False},
-        "experts": {"enable_ngram": True, "enable_pointer": True, "enable_doc_bias": True},
+        "experts": {"enable_ngram": False, "enable_pointer": False, "enable_doc_bias": False},
         "adaptation": {"meta_enabled": False, "strict_commit_steps": 1},
-        "eval": {"policy": "strict_causal", "score_tokens": 8, "adapt_tokens": 16, "documentwise": True},
+        "eval": {"policy": "strict_causal", "score_tokens": 4, "adapt_tokens": 8, "documentwise": False},
     }
     path.write_text(json.dumps(config), encoding="utf-8")
 
@@ -138,4 +138,6 @@ def test_cli_train_and_eval_smoke(tmp_path):
     strict_eval = run_cmd([sys.executable, "scripts/hg_eval.py", "--config", str(eval_config_path), "--checkpoint", checkpoint, "--policy", "strict"])
     exploratory_eval = run_cmd([sys.executable, "scripts/hg_eval.py", "--config", str(config_path), "--checkpoint", checkpoint, "--policy", "exploratory"])
     assert "val_bpb" in strict_eval
+    assert strict_eval["gate_summary"] == {}
+    assert strict_eval["token_count"] == 5
     assert exploratory_eval["policy"]["legal_for_submission"] is False

@@ -12,16 +12,22 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from hybrid_golf.config import apply_overrides, ensure_required_sections, load_config_file
+from hybrid_golf.config import apply_overrides, deep_merge, ensure_required_sections, load_config_file
 from hybrid_golf.evaluate import evaluate_checkpoint
 
 
 def resolve_eval_config(config_path: str, checkpoint_path: str, overrides: list[str]) -> dict[str, object]:
+    config_file = Path(config_path)
+    raw_file_config = json.loads(config_file.read_text(encoding="utf-8"))
+    if not isinstance(raw_file_config, dict):
+        raise ValueError(f"Config root must be a JSON object: {config_file}")
     file_config = load_config_file(config_path)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     checkpoint_config = checkpoint.get("config") if isinstance(checkpoint, dict) else None
     if isinstance(checkpoint_config, dict):
-        resolved = ensure_required_sections(checkpoint_config)
+        # Checkpoints should define the architecture by default, but the passed
+        # config file must still be able to override eval/data/export behavior.
+        resolved = ensure_required_sections(deep_merge(checkpoint_config, raw_file_config))
     else:
         resolved = file_config
     if overrides:
