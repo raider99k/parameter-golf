@@ -5,6 +5,7 @@
 Build a **legal parameter-golf submission** that is competitive under the actual challenge constraints:
 
 - artifact size must fit within **16 MB**
+- training must fit within the **10 minute challenge budget**
 - evaluation must be **causal and leaderboard-safe**
 - results must matter under the real objective, not just under toy smoke runs
 - the final system should be a **submission candidate**, not only a research sandbox
@@ -71,20 +72,24 @@ Every serious branch must eventually satisfy all of these:
 1. **Artifact budget**
    The final exported artifact must be under `16 MB`.
 
-2. **Legal evaluation**
+2. **Training budget**
+   The final training recipe must fit within the challenge's `10 minute` budget.
+
+3. **Legal evaluation**
    Default path must stay within `strict_causal`.
 
-3. **Real byte accounting**
+4. **Real byte accounting**
    BPB must always be computed with the challenge-aligned byte metric.
 
-4. **Submission realism**
+5. **Submission realism**
    Candidate decisions must be made using runs that are close enough to the real regime to transfer.
 
-5. **Reproducibility**
+6. **Reproducibility**
    Each serious run must leave behind:
    - resolved config
    - checkpoint
    - export size
+   - train wallclock
    - eval result
    - notes on whether the result is smoke, proxy, or submission-grade
 
@@ -291,7 +296,14 @@ Deliverable:
   - resolved config
   - exported artifact
   - artifact bytes
+  - measured train wallclock
   - eval result
+
+Wallclock rule:
+
+- fixed-step runs are acceptable for `smoke` debugging
+- fixed-step runs are acceptable for rough `proxy` ranking only when they are clearly labeled as such
+- any run that influences submission decisions must be compared under an explicit wallclock cap, not only equal step counts
 
 ## Phase 2: Build A Challenge-Faithful Static Prior
 
@@ -365,10 +377,11 @@ Status: not started
 A run can only be called a submission candidate if all of this is true:
 
 1. exported artifact is under `16 MB`
-2. evaluation path is `strict_causal`
-3. roundtrip score matches closely
-4. result is reproduced on a meaningful validation slice
-5. the candidate beats the previous internal baseline
+2. training recipe fits within the `10 minute` budget
+3. evaluation path is `strict_causal`
+4. roundtrip score matches closely
+5. result is reproduced on a meaningful validation slice
+6. the candidate beats the previous internal baseline
 
 Expected output:
 
@@ -403,16 +416,17 @@ Until Phase 1 and Phase 2 are tighter, stop doing these by default:
 These are the highest-priority concrete tasks.
 
 1. Add automatic artifact export and byte reporting to serious runs.
-2. Define what counts as a `serious run` in config terms.
-3. Freeze the current clean baseline:
+2. Make wallclock a first-class metric for serious runs.
+3. Define what counts as a `serious run` in config terms.
+4. Freeze the current clean baseline:
    - strict
    - doc_bias only
    - no pointer
    - no ngram
    - no meta
    - no adaptive extra pass
-4. Start the budget-aware static-prior phase instead of blind capacity scaling.
-5. Re-test hybrid additions only after the stronger prior exists.
+5. Start the budget-aware static-prior phase instead of blind capacity scaling.
+6. Re-test hybrid additions only after the stronger prior exists.
 
 ## Current Baseline To Beat
 
@@ -444,3 +458,7 @@ From this point on, every experiment should answer one of only three questions:
 3. Does it improve the **submission artifact** without breaking accuracy?
 
 If it answers none of those, it is not on the critical path to submission.
+
+Additional rule for experiment hygiene:
+
+- if a run is not wallclock-capped, it is not allowed to decide the final submission recipe by itself
