@@ -2068,8 +2068,8 @@ def main(argv: list[str] | None = None) -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    meta_schedule_desc = "wallclock_frac" if max_wallclock_ms is not None else "step_frac"
     if args.use_fast_adapters:
+        meta_schedule_desc = "wallclock_frac" if args.max_wallclock_seconds > 0 else "step_frac"
         log0(
             f"fast_gate_init:{args.fast_gate_init:.4f} "
             f"meta_pair_tokens:{meta_pair_tokens} meta_local_tokens:{meta_local_tokens} "
