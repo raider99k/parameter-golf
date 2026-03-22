@@ -86,8 +86,7 @@ def evaluate_tokens(
                     or disagreement >= float(config["eval"]["adaptive_disagreement_threshold"])
                 ):
                     context.extra_passes = 1
-            with torch.no_grad():
-                result = policy.score_block(model, context, experts)
+            result = policy.score_block(model, context, experts)
             loss_sum, byte_count, token_count = _loss_and_bytes(
                 result.logprobs,
                 result.targets,
@@ -130,7 +129,7 @@ def evaluate_tokens(
         "token_count": int(total_token_count),
         "byte_count": float(total_byte_count),
         "gate_summary": summary_weights,
-        "blocks": gate_rows,
+        "blocks": gate_rows if bool(config["eval"]["write_block_logs"]) else [],
     }
 
 

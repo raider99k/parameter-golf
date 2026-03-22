@@ -96,11 +96,12 @@ class StrictCausalPolicy(EvalPolicy):
     def score_block(self, model: HybridGPT, context: BlockContext, experts: list[OnlineExpert]) -> BlockResult:
         if self.writable_state is None:
             raise RuntimeError("Policy state is not initialized; call reset_document first")
-        logits = model.forward_logits(
-            context.x_full,
-            writable_state=self.writable_state,
-            extra_passes=context.extra_passes,
-        )
+        with torch.no_grad():
+            logits = model.forward_logits(
+                context.x_full,
+                writable_state=self.writable_state,
+                extra_passes=context.extra_passes,
+            )
         base_logprobs = torch.log_softmax(logits[0, context.score_offset : context.score_offset + context.score_len], dim=-1)
         current_inputs = context.x_full[0, context.score_offset : context.score_offset + context.score_len]
         expert_logprobs = {
