@@ -1,0 +1,183 @@
+from __future__ import annotations
+
+import copy
+import json
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "run": {
+        "id": "hybrid_smoke",
+        "output_root": "outputs/hybrid",
+        "seed": 1337,
+        "device": "auto",
+        "dtype": "auto",
+    },
+    "data": {
+        "train_glob": "./data/datasets/fineweb10B_sp1024/fineweb_train_*.bin",
+        "val_glob": "./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin",
+        "val_tokens_limit": 0,
+    },
+    "tokenizer": {
+        "path": "./data/tokenizers/fineweb_1024_bpe.model",
+        "kind": "auto",
+        "bos_id": 1,
+        "eos_id": 2,
+    },
+    "model": {
+        "vocab_size": 1024,
+        "num_layers": 4,
+        "model_dim": 128,
+        "num_heads": 4,
+        "num_kv_heads": 2,
+        "mlp_mult": 2,
+        "tie_embeddings": True,
+        "use_factor_embed": False,
+        "embed_dim": 96,
+        "rope_base": 10000.0,
+        "logit_softcap": 30.0,
+        "writable_rank": 4,
+        "writable_blocks": 2,
+        "recurrent_top_block": False,
+        "max_extra_passes": 1,
+        "tied_embed_init_std": 0.02,
+    },
+    "train": {
+        "enabled": True,
+        "iterations": 50,
+        "batch_tokens": 1024,
+        "seq_len": 64,
+        "lr": 3e-4,
+        "weight_decay": 0.01,
+        "warmup_steps": 8,
+        "grad_clip_norm": 1.0,
+        "train_log_every": 10,
+        "val_every": 0,
+        "max_wallclock_seconds": 0.0,
+    },
+    "experts": {
+        "enable_ngram": True,
+        "enable_pointer": True,
+        "enable_doc_bias": True,
+        "ngram_order": 4,
+        "ngram_buckets": 8192,
+        "ngram_alpha": 0.25,
+        "pointer_window": 256,
+        "pointer_alpha": 0.1,
+        "doc_bias_alpha": 0.1,
+        "gate": {
+            "base": {"ngram": 0.15, "pointer": 0.20, "doc_bias": 0.10},
+            "entropy_scale": {"ngram": 0.10, "pointer": 0.25, "doc_bias": 0.05},
+            "repeat_scale": {"ngram": 0.20, "pointer": 0.45, "doc_bias": 0.10},
+            "confidence_scale": {"ngram": 0.35, "pointer": 0.35, "doc_bias": 0.20},
+            "max_weight": 1.5,
+        },
+    },
+    "adaptation": {
+        "meta_enabled": False,
+        "meta_steps": 1,
+        "meta_adapt_tokens": 128,
+        "meta_query_tokens": 128,
+        "meta_loss_a_weight": 0.2,
+        "meta_loss_b_weight": 0.8,
+        "meta_every": 4,
+        "inner_clip": 0.1,
+        "doc_bias_lr": 0.05,
+        "doc_bias_decay": 0.995,
+        "strict_commit_steps": 1,
+        "exploratory_prefix_steps": 1,
+        "exploratory_persist_across_docs": False,
+    },
+    "eval": {
+        "policy": "strict_causal",
+        "score_tokens": 64,
+        "adapt_tokens": 256,
+        "window_tokens": 0,
+        "documentwise": True,
+        "adaptive_extra_pass": False,
+        "adaptive_entropy_threshold": 4.5,
+        "adaptive_disagreement_threshold": 0.35,
+        "write_block_logs": True,
+    },
+    "export": {
+        "artifact_name": "model.int8.ptz",
+        "keep_float_max_numel": 4096,
+        "zlib_level": 9,
+    },
+}
+
+
+REQUIRED_TOP_LEVEL_KEYS = tuple(DEFAULT_CONFIG.keys())
+
+
+def deep_merge(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
+    merged = copy.deepcopy(base)
+    for key, value in update.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def coerce_override_value(text: str) -> Any:
+    lowered = text.strip().lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    if lowered in {"null", "none"}:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def parse_override(text: str) -> tuple[list[str], Any]:
+    if "=" not in text:
+        raise ValueError(f"Expected dotted.path=value override, got {text!r}")
+    key, raw_value = text.split("=", 1)
+    path = [part.strip() for part in key.split(".") if part.strip()]
+    if not path:
+        raise ValueError(f"Override is missing a key: {text!r}")
+    return path, coerce_override_value(raw_value)
+
+
+def set_deep(config: dict[str, Any], path: list[str], value: Any) -> None:
+    cursor = config
+    for key in path[:-1]:
+        next_value = cursor.get(key)
+        if not isinstance(next_value, dict):
+            next_value = {}
+            cursor[key] = next_value
+        cursor = next_value
+    cursor[path[-1]] = value
+
+
+def apply_overrides(config: dict[str, Any], overrides: list[str]) -> dict[str, Any]:
+    resolved = copy.deepcopy(config)
+    for override in overrides:
+        path, value = parse_override(override)
+        set_deep(resolved, path, value)
+    return resolved
+
+
+def ensure_required_sections(config: dict[str, Any]) -> dict[str, Any]:
+    resolved = copy.deepcopy(config)
+    for key in REQUIRED_TOP_LEVEL_KEYS:
+        if key not in resolved:
+            resolved[key] = copy.deepcopy(DEFAULT_CONFIG[key])
+        elif isinstance(DEFAULT_CONFIG[key], dict) and isinstance(resolved[key], dict):
+            resolved[key] = deep_merge(DEFAULT_CONFIG[key], resolved[key])
+    return resolved
+
+
+def load_config_file(path: str | Path, overrides: list[str] | None = None) -> dict[str, Any]:
+    config_path = Path(path)
+    loaded = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Config root must be a JSON object: {config_path}")
+    config = ensure_required_sections(deep_merge(DEFAULT_CONFIG, loaded))
+    if overrides:
+        config = ensure_required_sections(apply_overrides(config, overrides))
+    return config

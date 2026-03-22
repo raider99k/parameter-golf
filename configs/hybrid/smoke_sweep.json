@@ -1,0 +1,24 @@
+{
+  "jobs": [
+    {
+      "name": "strict_train",
+      "kind": "train",
+      "config": "configs/hybrid/tiny_strict.json",
+      "run_id": "sweep_strict_train"
+    },
+    {
+      "name": "strict_eval",
+      "kind": "eval",
+      "config": "configs/hybrid/tiny_strict.json",
+      "checkpoint": "strict_train",
+      "policy": "strict"
+    },
+    {
+      "name": "exploratory_eval",
+      "kind": "eval",
+      "config": "configs/hybrid/tiny_exploratory.json",
+      "checkpoint": "strict_train",
+      "policy": "exploratory"
+    }
+  ]
+}

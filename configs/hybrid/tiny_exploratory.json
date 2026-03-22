@@ -1,0 +1,48 @@
+{
+  "run": {
+    "id": "tiny_exploratory"
+  },
+  "model": {
+    "vocab_size": 260,
+    "num_layers": 2,
+    "model_dim": 64,
+    "num_heads": 4,
+    "num_kv_heads": 2,
+    "mlp_mult": 2,
+    "tie_embeddings": true,
+    "use_factor_embed": false,
+    "embed_dim": 64,
+    "writable_rank": 4,
+    "writable_blocks": 2,
+    "recurrent_top_block": true
+  },
+  "train": {
+    "iterations": 20,
+    "batch_tokens": 256,
+    "seq_len": 32,
+    "lr": 0.0005,
+    "train_log_every": 5,
+    "val_every": 0
+  },
+  "experts": {
+    "enable_ngram": true,
+    "enable_pointer": true,
+    "enable_doc_bias": true
+  },
+  "adaptation": {
+    "meta_enabled": true,
+    "meta_steps": 1,
+    "meta_adapt_tokens": 64,
+    "meta_query_tokens": 64,
+    "strict_commit_steps": 1,
+    "exploratory_prefix_steps": 1,
+    "exploratory_persist_across_docs": true
+  },
+  "eval": {
+    "policy": "exploratory_ttt",
+    "score_tokens": 32,
+    "adapt_tokens": 128,
+    "documentwise": true,
+    "adaptive_extra_pass": true
+  }
+}

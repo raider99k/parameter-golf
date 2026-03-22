@@ -1,0 +1,42 @@
+{
+  "run": {
+    "id": "tiny_strict"
+  },
+  "model": {
+    "vocab_size": 260,
+    "num_layers": 2,
+    "model_dim": 64,
+    "num_heads": 4,
+    "num_kv_heads": 2,
+    "mlp_mult": 2,
+    "tie_embeddings": true,
+    "use_factor_embed": false,
+    "embed_dim": 64,
+    "writable_rank": 4,
+    "writable_blocks": 2,
+    "recurrent_top_block": false
+  },
+  "train": {
+    "iterations": 20,
+    "batch_tokens": 256,
+    "seq_len": 32,
+    "lr": 0.0005,
+    "train_log_every": 5,
+    "val_every": 0
+  },
+  "experts": {
+    "enable_ngram": true,
+    "enable_pointer": true,
+    "enable_doc_bias": true
+  },
+  "adaptation": {
+    "meta_enabled": false,
+    "strict_commit_steps": 1
+  },
+  "eval": {
+    "policy": "strict_causal",
+    "score_tokens": 32,
+    "adapt_tokens": 128,
+    "documentwise": true
+  }
+}
