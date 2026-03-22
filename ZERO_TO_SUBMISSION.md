@@ -36,6 +36,43 @@ What is currently true:
 - we are **not yet running a frontier-strength static prior**
 - export is currently **int8 + zlib**, not a frontier-grade mixed-bit submission export
 
+## Frontier Reality Check
+
+As of **March 22, 2026**, the official accepted leaderboard in the repo README still tops out at **1.1428 BPB** with `10L Int5-MLP + BigramHash(10240)` by `thwu1`.
+
+But the live open-PR frontier is already materially stronger:
+
+- best validated **non-TTT** candidate tracked in the live commentary thread is **1.1233 BPB** in [PR #414](https://github.com/openai/parameter-golf/pull/414)
+- best tracked **TTT** candidate is **1.1221 BPB** in [PR #398](https://github.com/openai/parameter-golf/pull/398)
+- the TTT line is under legitimacy scrutiny in [Issue #140](https://github.com/openai/parameter-golf/issues/140), which explicitly notes uncertainty around pre-eval adaptation on validation tokens before scoring
+
+Implication:
+
+- the official README leaderboard is already stale relative to the live frontier
+- our real target is not `1.1428`
+- our current serious proxy numbers are still far from the live non-TTT frontier
+- we should not drift into optimizing for a tiny local improvement on a weak prior
+
+## North Star
+
+We are not trying to win with a `+0.001 BPB` garnish on a mediocre stack.
+
+We want a **regime change**.
+
+Concretely:
+
+- beat the live **non-TTT** frontier, not only the stale accepted table
+- treat the challenge as **causal online compression**, not only as static-weight packing
+- store global web priors in the artifact
+- use only **legal causal mechanisms** to absorb document-local structure during evaluation
+- first build a `#414`-class compact prior, then test whether hybrid online structure can create a real step-change on top
+
+The strategic bet remains:
+
+- strongest compact static prior we can afford under `16 MB`
+- then a legal causal residual compressor on top of it
+- not blind trick stacking
+
 ## Answer To The Key Question
 
 ### Is it okay that we are testing without all the frontier implementations?
@@ -441,13 +478,18 @@ Internal research baseline right now:
   - `meta` disabled
   - `adaptive_extra_pass` disabled
 
-Best observed proxy result so far:
+Best observed serious proxy result so far:
 
-- `ada_strict12x384_seq512_5000`
-- `val_bpb = 2.0586827028568235`
+- `ada_proxy12x384_seq512_w540`
+- `val_bpb = 1.7747509821863527`
 - validation slice: `131072` tokens
+- eval regime: reduced-slice proxy (`256/512` windows), not yet parity-lite or full parity
 
-This is the current internal number to beat, but it is still a **proxy baseline**, not yet a final submission-grade result.
+Current perspective:
+
+- this is our best internal serious-proxy baseline
+- it is still far from the live non-TTT frontier at `1.1233`
+- the remaining gap is too large to justify complacency
 
 ## Final Rule
 
