@@ -468,6 +468,15 @@ Additional rule for experiment hygiene:
 The repository now includes:
 
 - [challenge_parity.json](/c:/Users/pasqu/OpenChallenge/parameter-golf/configs/hybrid/challenge_parity.json)
+- [challenge_parity_lite.json](/c:/Users/pasqu/OpenChallenge/parameter-golf/configs/hybrid/challenge_parity_lite.json)
 - [CHALLENGE_PARITY_CHECKLIST.md](/c:/Users/pasqu/OpenChallenge/parameter-golf/CHALLENGE_PARITY_CHECKLIST.md)
 
 These define the minimum standard for treating a `hybrid_golf` result as challenge-ready rather than merely proxy-valid.
+
+Recommended workflow:
+
+1. Use `challenge_parity_lite.json` for candidate ranking.
+   It keeps the final evaluator semantics but limits validation to a smaller slice for iteration speed.
+2. Use `challenge_parity.json` only on the best 1-2 runs.
+   That is the final parity gate before calling a result submission-grade.
+3. Do not let lite-parity or older proxy runs decide the final recipe by themselves.

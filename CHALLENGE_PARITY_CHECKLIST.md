@@ -12,6 +12,10 @@ Primary preset:
 
 - [challenge_parity.json](/c:/Users/pasqu/OpenChallenge/parameter-golf/configs/hybrid/challenge_parity.json)
 
+Candidate-ranking preset:
+
+- [challenge_parity_lite.json](/c:/Users/pasqu/OpenChallenge/parameter-golf/configs/hybrid/challenge_parity_lite.json)
+
 ## Required Conditions
 
 1. Training run is wallclock-capped.
@@ -66,6 +70,12 @@ If you want a base-prior ablation, override:
 
 ## Standard Commands
 
+Recommended evaluation funnel:
+
+1. Use `challenge_parity_lite.json` for day-to-day candidate ranking.
+2. Use full [challenge_parity.json](/c:/Users/pasqu/OpenChallenge/parameter-golf/configs/hybrid/challenge_parity.json) only for the best 1-2 runs.
+3. Do not let reduced-slice proxy evals bypass the final parity gate.
+
 Train a serious wallclock-capped run:
 
 ```bash
@@ -104,6 +114,15 @@ python3 scripts/hg_eval.py \
   --checkpoint <checkpoint> \
   --policy strict \
   --set experts.enable_doc_bias=false
+```
+
+Parity-lite eval for candidate ranking:
+
+```bash
+python3 scripts/hg_eval.py \
+  --config configs/hybrid/challenge_parity_lite.json \
+  --checkpoint <checkpoint> \
+  --policy strict
 ```
 
 ## What Does Not Count As Submission-Grade
