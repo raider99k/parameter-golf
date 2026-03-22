@@ -3,7 +3,7 @@
     "id": "tiny_strict"
   },
   "model": {
-    "vocab_size": 260,
+    "vocab_size": 1024,
     "num_layers": 2,
     "model_dim": 64,
     "num_heads": 4,
