@@ -50,8 +50,10 @@ class Hyperparameters:
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    val_loss_every_seconds = float(os.environ.get("VAL_LOSS_EVERY_SECONDS", "0"))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     validate_at_step_zero = bool(int(os.environ.get("VALIDATE_AT_STEP_ZERO", "0")))
+    restore_best_val_checkpoint = bool(int(os.environ.get("RESTORE_BEST_VAL_CHECKPOINT", "0")))
 
     use_projection_qat = bool(int(os.environ.get("USE_PROJECTION_QAT", "0")))
     qat_start_ms = float(os.environ.get("QAT_START_MS", 540000.0))
@@ -64,6 +66,7 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", "0"))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -117,6 +120,7 @@ class Hyperparameters:
     train_meta_steps = int(os.environ.get("TRAIN_META_STEPS", 1))
     train_meta_first_order = bool(int(os.environ.get("TRAIN_META_FIRST_ORDER", 1)))
     train_meta_min_seqs_per_side = int(os.environ.get("TRAIN_META_MIN_SEQS_PER_SIDE", 4))
+    train_meta_pair_tokens = int(os.environ.get("TRAIN_META_PAIR_TOKENS", "0"))
     train_meta_aux_weight = float(os.environ.get("TRAIN_META_AUX_WEIGHT", 0.25))
     train_meta_loss_a_weight = float(os.environ.get("TRAIN_META_LOSS_A_WEIGHT", 0.2))
     train_meta_loss_b_weight = float(os.environ.get("TRAIN_META_LOSS_B_WEIGHT", 0.8))
@@ -155,8 +159,10 @@ class Hyperparameters:
 
         # Validation cadence and batch size. Validation always uses the full fineweb_val split.
         self.val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+        self.val_loss_every_seconds = float(os.environ.get("VAL_LOSS_EVERY_SECONDS", "0"))
         self.train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
         self.validate_at_step_zero = bool(int(os.environ.get("VALIDATE_AT_STEP_ZERO", "0")))
+        self.restore_best_val_checkpoint = bool(int(os.environ.get("RESTORE_BEST_VAL_CHECKPOINT", "0")))
 
         self.use_projection_qat = bool(int(os.environ.get("USE_PROJECTION_QAT", "0")))
         self.qat_start_ms = float(os.environ.get("QAT_START_MS", 540000.0))
@@ -169,6 +175,7 @@ class Hyperparameters:
         self.warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
         self.train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
         self.train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+        self.grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", "0"))
         self.max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
         self.qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -222,6 +229,7 @@ class Hyperparameters:
         self.train_meta_steps = int(os.environ.get("TRAIN_META_STEPS", 1))
         self.train_meta_first_order = bool(int(os.environ.get("TRAIN_META_FIRST_ORDER", 1)))
         self.train_meta_min_seqs_per_side = int(os.environ.get("TRAIN_META_MIN_SEQS_PER_SIDE", 4))
+        self.train_meta_pair_tokens = int(os.environ.get("TRAIN_META_PAIR_TOKENS", "0"))
         self.train_meta_aux_weight = float(os.environ.get("TRAIN_META_AUX_WEIGHT", 0.25))
         self.train_meta_loss_a_weight = float(os.environ.get("TRAIN_META_LOSS_A_WEIGHT", 0.2))
         self.train_meta_loss_b_weight = float(os.environ.get("TRAIN_META_LOSS_B_WEIGHT", 0.8))
@@ -267,6 +275,7 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "FAST_GRAD_CLIP",
     "FAST_GATE_INIT",
     "FAST_RANK",
+    "GRAD_ACCUM_STEPS",
     "GRAD_CLIP_NORM",
     "HEAD_LR",
     "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
@@ -294,6 +303,7 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "QAT_START_MS",
     "QK_GAIN_INIT",
     "RANK",
+    "RESTORE_BEST_VAL_CHECKPOINT",
     "ROPE_BASE",
     "RUN_ID",
     "SCALAR_LR",
@@ -310,6 +320,7 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "TRAIN_META_AUX_WEIGHT",
     "TRAIN_META_LOSS_A_WEIGHT",
     "TRAIN_META_LOSS_B_WEIGHT",
+    "TRAIN_META_PAIR_TOKENS",
     "TRAIN_META_ADAPTER_ONLY",
     "TRAIN_META_BATCH_DOCS",
     "TRAIN_META_DOCUMENT_EPISODES",
@@ -329,6 +340,7 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "USE_PROJECTION_QAT",
     "VALIDATE_AT_STEP_ZERO",
     "VAL_LOSS_EVERY",
+    "VAL_LOSS_EVERY_SECONDS",
     "VAL_TOKENS_LIMIT",
     "VOCAB_SIZE",
     "WARMDOWN_ITERS",
@@ -1774,10 +1786,14 @@ def main(argv: list[str] | None = None) -> None:
             "TRAIN_META_ADAPT_TOKENS and TRAIN_META_QUERY_TOKENS must be positive, "
             f"got {args.train_meta_adapt_tokens} and {args.train_meta_query_tokens}"
         )
+    if args.train_meta_pair_tokens < 0:
+        raise ValueError(f"TRAIN_META_PAIR_TOKENS must be non-negative, got {args.train_meta_pair_tokens}")
     if args.eval_window <= 0 or args.eval_score <= 0:
         raise ValueError(f"EVAL_WINDOW and EVAL_SCORE must be positive, got {args.eval_window} and {args.eval_score}")
     if args.eval_adapt < 0 or args.eval_ttt_steps < 0:
         raise ValueError(f"EVAL_ADAPT and EVAL_TTT_STEPS must be non-negative, got {args.eval_adapt} and {args.eval_ttt_steps}")
+    if args.val_loss_every_seconds < 0:
+        raise ValueError(f"VAL_LOSS_EVERY_SECONDS must be non-negative, got {args.val_loss_every_seconds}")
     meta_training_configured = args.train_meta_every > 0 and args.train_meta_steps > 0
     if args.train_meta_adapter_only and meta_training_configured and not args.use_fast_adapters:
         raise ValueError("TRAIN_META_ADAPTER_ONLY requires USE_FAST_ADAPTERS=1")
@@ -1798,17 +1814,35 @@ def main(argv: list[str] | None = None) -> None:
     distributed = world_size > 1 and "RANK" in os.environ and "WORLD_SIZE" in os.environ
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    if args.grad_accum_steps > 0:
+        grad_accum_steps = args.grad_accum_steps
+    else:
+        if 8 % world_size != 0:
+            raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so auto grad_accum_steps stays integral")
+        grad_accum_steps = 8 // world_size
+    if grad_accum_steps <= 0:
+        raise ValueError(f"GRAD_ACCUM_STEPS must be positive, got {grad_accum_steps}")
     if args.train_batch_tokens <= 0 or args.train_seq_len <= 0:
         raise ValueError("TRAIN_BATCH_TOKENS and TRAIN_SEQ_LEN must be positive")
-    if args.train_batch_tokens % (8 * args.train_seq_len) != 0:
+    if args.train_batch_tokens % (world_size * grad_accum_steps * args.train_seq_len) != 0:
         raise ValueError(
-            f"TRAIN_BATCH_TOKENS={args.train_batch_tokens} must be divisible by 8 * TRAIN_SEQ_LEN={args.train_seq_len}"
+            "TRAIN_BATCH_TOKENS must be divisible by "
+            f"WORLD_SIZE * GRAD_ACCUM_STEPS * TRAIN_SEQ_LEN = {world_size} * {grad_accum_steps} * {args.train_seq_len} "
+            f"(got TRAIN_BATCH_TOKENS={args.train_batch_tokens})"
         )
     local_train_tokens = args.train_batch_tokens // (world_size * grad_accum_steps)
-    meta_pair_tokens = max(local_train_tokens // 2, args.train_meta_min_seqs_per_side * args.train_seq_len)
+    min_meta_pair_tokens = args.train_meta_min_seqs_per_side * args.train_seq_len
+    meta_pair_tokens = args.train_meta_pair_tokens if args.train_meta_pair_tokens > 0 else max(local_train_tokens // 2, min_meta_pair_tokens)
+    if meta_pair_tokens < min_meta_pair_tokens:
+        raise ValueError(
+            f"TRAIN_META_PAIR_TOKENS must be at least {min_meta_pair_tokens} tokens for "
+            f"TRAIN_META_MIN_SEQS_PER_SIDE={args.train_meta_min_seqs_per_side} and TRAIN_SEQ_LEN={args.train_seq_len}, "
+            f"got {meta_pair_tokens}"
+        )
+    if meta_pair_tokens % args.train_seq_len != 0:
+        raise ValueError(
+            f"TRAIN_META_PAIR_TOKENS={meta_pair_tokens} must be divisible by TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
     meta_local_tokens = 2 * meta_pair_tokens
     if args.use_fast_adapters and args.train_meta_every > 0 and local_train_tokens % args.train_seq_len != 0:
         raise ValueError(
@@ -2034,6 +2068,7 @@ def main(argv: list[str] | None = None) -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    meta_schedule_desc = "wallclock_frac" if max_wallclock_ms is not None else "step_frac"
     if args.use_fast_adapters:
         log0(
             f"fast_gate_init:{args.fast_gate_init:.4f} "
@@ -2044,6 +2079,8 @@ def main(argv: list[str] | None = None) -> None:
         if args.train_meta_every > 0 and args.train_meta_steps > 0:
             log0(
                 f"train_meta_mode:{args.train_meta_mode} "
+                f"train_meta_schedule:{meta_schedule_desc} "
+                f"start:{args.train_meta_start_frac:.3f} end:{args.train_meta_end_frac:.3f} "
                 f"train_meta_aux_weight:{args.train_meta_aux_weight:.4f} "
                 f"train_meta_loss_a_weight:{args.train_meta_loss_a_weight:.4f} "
                 f"train_meta_loss_b_weight:{args.train_meta_loss_b_weight:.4f} "
@@ -2095,6 +2132,11 @@ def main(argv: list[str] | None = None) -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
+    def schedule_progress(step: int, elapsed_ms: float) -> float:
+        if max_wallclock_ms is not None:
+            return min(max(elapsed_ms / max(max_wallclock_ms, 1e-9), 0.0), 1.0)
+        return min(step / max(args.iterations, 1), 1.0)
+
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
@@ -2136,16 +2178,30 @@ def main(argv: list[str] | None = None) -> None:
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
+    val_interval_ms = args.val_loss_every_seconds * 1000.0 if args.val_loss_every_seconds > 0 else None
+    next_val_ms = val_interval_ms
+    best_val_loss: float | None = None
+    best_val_bpb: float | None = None
+    best_val_step: int | None = None
+    best_val_train_time_ms: float | None = None
+    best_state_dict: dict[str, torch.Tensor] | None = None
 
     step = 0
     while True:
+        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        should_validate = last_step or (
+        should_validate_by_step = (
             args.val_loss_every > 0
             and (args.validate_at_step_zero or step > 0)
             and step % args.val_loss_every == 0
         )
+        should_validate_by_time = (
+            next_val_ms is not None
+            and (args.validate_at_step_zero or step > 0)
+            and elapsed_ms >= next_val_ms
+        )
+        should_validate = last_step or should_validate_by_step or should_validate_by_time
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
@@ -2166,6 +2222,23 @@ def main(argv: list[str] | None = None) -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if best_val_bpb is None or val_bpb < best_val_bpb:
+                best_val_loss = val_loss
+                best_val_bpb = val_bpb
+                best_val_step = step
+                best_val_train_time_ms = training_time_ms
+                if args.restore_best_val_checkpoint:
+                    best_state_dict = {
+                        name: tensor.detach().cpu().clone()
+                        for name, tensor in base_model.state_dict().items()
+                    }
+                log0(
+                    f"best_val_update step:{step}/{args.iterations} val_loss:{val_loss:.4f} "
+                    f"val_bpb:{val_bpb:.4f} train_time:{training_time_ms:.0f}ms"
+                )
+            if next_val_ms is not None:
+                while next_val_ms <= training_time_ms:
+                    next_val_ms += val_interval_ms
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -2177,7 +2250,7 @@ def main(argv: list[str] | None = None) -> None:
                 )
             break
 
-        progress = step / max(args.iterations, 1)
+        progress = schedule_progress(step, elapsed_ms)
         meta_phase_active = (
             args.use_fast_adapters
             and args.train_meta_start_frac <= progress < args.train_meta_end_frac
@@ -2344,6 +2417,17 @@ def main(argv: list[str] | None = None) -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    if best_val_bpb is not None:
+        log0(
+            f"best_val_summary step:{best_val_step}/{args.iterations} val_loss:{best_val_loss:.4f} "
+            f"val_bpb:{best_val_bpb:.4f} train_time:{best_val_train_time_ms:.0f}ms"
+        )
+    if args.restore_best_val_checkpoint and best_state_dict is not None:
+        base_model.load_state_dict(best_state_dict, strict=True)
+        log0(
+            f"restored_best_val_checkpoint step:{best_val_step}/{args.iterations} "
+            f"train_time:{best_val_train_time_ms:.0f}ms"
+        )
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
