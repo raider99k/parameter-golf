@@ -330,9 +330,9 @@ After `640d` won, the search moved to the local ridge around that width while st
 4. `8L 896d e704 4x2 mlp3` exceeded the `16MB` artifact cap and is not a valid submission direction.
 5. The depth branch should remain paused unless a later regime change creates new evidence.
 
-## Current Best Ada Line
+## Best 180s Ada Line
 
-Under the current trusted wallclock-tracked methodology, the best line so far is:
+Under the current trusted wallclock-tracked methodology at `180s`, the best line was:
 
 - `NUM_LAYERS=8`
 - `NUM_UNIQUE_ATTN=4`
@@ -355,7 +355,7 @@ Best observed result on `SEED=3407`:
 - final int8 roundtrip `val_bpb`: `1.7832`
 - total submission size int8+zlib: `8,743,097` bytes
 
-## Updated Current State Summary
+## State Summary After 180s Ridge Search
 
 1. Older fixed-step / early-Ada results remain useful as exploration history, but they are no longer the strongest evidence base.
 2. The trusted current methodology is the wallclock-tracked Ada regime with best-checkpoint restore.
@@ -364,3 +364,132 @@ Best observed result on `SEED=3407`:
 4. Width remains the dominant scaling lever.
 5. Depth is still losing under the current budget.
 6. There is still artifact-size headroom below `16MB`, but the current `180s` budget already shows diminishing returns past `640d`.
+
+## Re-Exploring Moonshot and Extreme on Ada
+
+Once the search had stabilized around `8L 640d e512 4x2 mlp3`, the previously discarded `moonshot` and `extreme` branches were re-opened under the stronger Ada systems regime.
+
+The question was no longer whether those branches looked good under early small-GPU settings. The question became:
+
+- can `moonshot` full meta-learning beat the current competitive line when the outer shape is held fixed?
+- can `extreme` architecture changes beat the same-shape competitive incumbent?
+
+### 180s branch re-checks
+
+| Variant | Params | Best `val_bpb` | Final int8 `val_bpb` | Total submission size int8+zlib |
+|---|---:|---:|---:|---:|
+| `moonshot` native default shape | `17,069,640` | `1.8483` | `1.8483` | `7,323,709` bytes |
+| `moonshot` default full document meta | `17,113,217` | `1.8210` | `1.8211` | `7,494,182` bytes |
+| `moonshot` same shape `8L 640d e512 4x2 mlp3`, full meta | `10,736,805` | `1.7946` | `1.7972` | `8,717,493` bytes |
+| `extreme` same shape `8L 640d e512 4x2 mlp3`, full branch | `10,768,165` | `1.8430` | `1.8452` | `8,788,566` bytes |
+
+### Interpretation
+
+1. `moonshot` native/default settings remained clearly behind the competitive line.
+2. Full `moonshot` document-meta training helped `moonshot` materially.
+3. The only `moonshot` variant worth taking seriously was the same-shape full-meta run.
+4. `extreme` was not competitive even when matched to the same outer shape.
+
+## 300s Head-to-Head: Competitive vs Moonshot Full Meta
+
+The next question was whether the same-shape `moonshot` full-meta branch would catch up at a longer wallclock budget.
+
+### 300s comparison
+
+| Variant | Params | Best `val_bpb` | Final int8 `val_bpb` | Total submission size int8+zlib |
+|---|---:|---:|---:|---:|
+| `competitive` same shape `8L 640d e512 4x2 mlp3`, fast/meta on | `10,736,805` | `1.7375` | `1.7403` | `8,770,099` bytes |
+| `moonshot` same shape full-meta document `replace` | `10,736,805` | `1.7508` | `1.7529` | `8,751,439` bytes |
+
+### Failed auxiliary full-meta attempt
+
+An additional `moonshot` same-shape `aux` document-meta run at `300s` was attempted, but it is **not** a valid comparison result:
+
+- the first `90s` validation (`1.8991`) happened before meta became active
+- the run hit OOM when the auxiliary full-meta path became active
+- the GPU was shared with another large process at the time
+
+This established that `aux` document-meta is much harder to run fairly at the full same-shape settings.
+
+### Fit probe for auxiliary document-meta
+
+To test feasibility, a reduced `aux` document-meta probe was run with:
+
+- `TRAIN_BATCH_TOKENS=16384`
+- `TRAIN_META_BATCH_DOCS=4`
+- `TRAIN_META_ADAPT_TOKENS=2048`
+- `TRAIN_META_QUERY_TOKENS=1024`
+
+Result:
+
+- params: `10,736,805`
+- best `val_bpb`: `1.7916`
+- final int8 roundtrip `val_bpb`: `1.7925`
+- total submission size int8+zlib: `8,769,347` bytes
+
+This showed that auxiliary document-meta can fit if the workload is reduced, but that result is not apples-to-apples against the main line.
+
+### Interpretation
+
+1. Same-shape `moonshot` full-meta `replace` is viable on Ada.
+2. It still lost to the competitive branch at `300s`:
+   - `1.7529` vs `1.7403`
+3. `moonshot` full meta-learning remained interesting, but no longer looked like the best use of search budget.
+4. `extreme` remained a losing branch and should stay deprioritized.
+
+## Fast Adapter Ablation on the Main Line
+
+The decisive follow-up test was to keep the same winning outer shape and simply disable fast adapters / meta entirely.
+
+### 300s fast-adapter ablation
+
+| Variant | Params | Best `val_bpb` | Final int8 `val_bpb` | Total submission size int8+zlib |
+|---|---:|---:|---:|---:|
+| `competitive` same shape `8L 640d e512 4x2 mlp3`, fast/meta on | `10,736,805` | `1.7375` | `1.7403` | `8,770,099` bytes |
+| `competitive` same shape `8L 640d e512 4x2 mlp3`, `USE_FAST_ADAPTERS=0` | `10,716,304` | `1.6892` | `1.6902` | `8,627,389` bytes |
+
+### Interpretation
+
+1. Under the stronger Ada regime and a `300s` budget, the fast-adapter/meta machinery is not helping the current main line.
+2. Disabling fast adapters improved the metric substantially:
+   - `1.6902` vs `1.7403`
+3. The no-fast run was also:
+   - slightly smaller
+   - faster per step
+   - much cheaper than `moonshot` full meta in VRAM
+4. This superseded the earlier `180s` conclusion that the fast/meta-enabled line was the current best.
+
+## Current Best Ada Line
+
+Under the current strongest evidence base, the best line is now:
+
+- `NUM_LAYERS=8`
+- `NUM_UNIQUE_ATTN=4`
+- `NUM_UNIQUE_MLP=2`
+- `MODEL_DIM=640`
+- `EMBED_DIM=512`
+- `MLP_MULT=3`
+- `TRAIN_SEQ_LEN=1024`
+- `TRAIN_BATCH_TOKENS=32768`
+- `GRAD_ACCUM_STEPS=1`
+- `USE_FAST_ADAPTERS=0`
+- `MAX_WALLCLOCK_SECONDS=300`
+- `VAL_LOSS_EVERY_SECONDS=90`
+- `RESTORE_BEST_VAL_CHECKPOINT=1`
+
+Best observed result on `SEED=3407`:
+
+- params: `10,716,304`
+- best `val_bpb`: `1.6892`
+- final int8 roundtrip `val_bpb`: `1.6902`
+- total submission size int8+zlib: `8,627,389` bytes
+
+## Latest State Summary
+
+1. The strongest current line is still the same outer architecture family:
+   - `8L 640d e512 4x2 mlp3`
+2. But the best version of that line is now the plain supervised one:
+   - `USE_FAST_ADAPTERS=0`
+3. `moonshot` full meta-learning is real and competitive, but still behind the best competitive no-fast run.
+4. `extreme` is not competitive under matched-shape Ada testing.
+5. The next most justified work is on dormant competitive features (`compile`, `QAT`, compression-aware training), not more moonshot/extreme scaling.
