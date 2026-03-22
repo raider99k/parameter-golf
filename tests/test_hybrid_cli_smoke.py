@@ -31,7 +31,7 @@ def write_pure_byte_tokenizer(path: Path) -> None:
 
 def write_config(path: Path, train_glob: str, val_glob: str, tokenizer_path: str, output_root: str) -> None:
     config = {
-        "run": {"id": "cli_smoke", "output_root": output_root, "device": "cpu"},
+        "run": {"id": "cli_smoke", "output_root": output_root, "device": "cpu", "stage": "proxy"},
         "data": {"train_glob": train_glob, "val_glob": val_glob, "val_tokens_limit": 0},
         "tokenizer": {"path": tokenizer_path, "kind": "pure_byte", "bos_id": 1, "eos_id": 2},
         "model": {
@@ -64,7 +64,8 @@ def write_config(path: Path, train_glob: str, val_glob: str, tokenizer_path: str
             "exploratory_prefix_steps": 1,
             "exploratory_persist_across_docs": False
         },
-        "eval": {"policy": "strict_causal", "score_tokens": 8, "adapt_tokens": 16, "documentwise": True}
+        "eval": {"policy": "strict_causal", "score_tokens": 8, "adapt_tokens": 16, "documentwise": True},
+        "export": {"write_after_train": True, "artifact_budget_bytes": 1_048_576}
     }
     path.write_text(json.dumps(config), encoding="utf-8")
 
@@ -132,6 +133,8 @@ def test_cli_train_and_eval_smoke(tmp_path):
     train_result = run_cmd([sys.executable, "scripts/hg_train.py", "--config", str(config_path)])
     checkpoint = train_result["checkpoint"]
     assert Path(checkpoint).is_file()
+    assert train_result["export"]["artifact_bytes"] > 0
+    assert Path(train_result["export"]["artifact_path"]).is_file()
     strict_eval = run_cmd([sys.executable, "scripts/hg_eval.py", "--config", str(eval_config_path), "--checkpoint", checkpoint, "--policy", "strict"])
     exploratory_eval = run_cmd([sys.executable, "scripts/hg_eval.py", "--config", str(config_path), "--checkpoint", checkpoint, "--policy", "exploratory"])
     assert "val_bpb" in strict_eval

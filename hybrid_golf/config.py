@@ -13,6 +13,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "seed": 1337,
         "device": "auto",
         "dtype": "auto",
+        "stage": "smoke",
     },
     "data": {
         "train_glob": "./data/datasets/fineweb10B_sp1024/fineweb_train_*.bin",
@@ -104,6 +105,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "artifact_name": "model.int8.ptz",
         "keep_float_max_numel": 4096,
         "zlib_level": 9,
+        "write_after_train": False,
+        "artifact_budget_bytes": 16_777_216,
+        "fail_if_over_budget": False,
     },
 }
 

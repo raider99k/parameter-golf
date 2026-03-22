@@ -7,6 +7,7 @@ import torch
 from .adaptation import adapt_writable_state, init_writable_state
 from .data import TokenBatcher
 from .evaluate import evaluate_model
+from .export import write_quantized_artifact
 from .model import build_model
 from .runtime import RunLogger, build_run_dir, resolve_autocast_dtype, resolve_device, seed_everything
 
@@ -17,7 +18,13 @@ def _lr_scale(step: int, warmup_steps: int) -> float:
     return min((step + 1) / warmup_steps, 1.0)
 
 
-def run_training(config: dict[str, object]) -> dict[str, str]:
+def _should_write_artifact_after_train(config: dict[str, object]) -> bool:
+    if bool(config["export"]["write_after_train"]):
+        return True
+    return str(config["run"].get("stage", "smoke")).strip().lower() != "smoke"
+
+
+def run_training(config: dict[str, object]) -> dict[str, object]:
     run_dir = build_run_dir(config)
     logger = RunLogger(run_dir)
     seed_everything(int(config["run"]["seed"]))
@@ -113,9 +120,48 @@ def run_training(config: dict[str, object]) -> dict[str, str]:
                 best_val = float(val_result["val_bpb"])
                 torch.save({"model_state": model.state_dict(), "config": config, "step": step + 1}, best_path)
 
-    torch.save({"model_state": model.state_dict(), "config": config}, checkpoint_path)
-    result = {"checkpoint": str(checkpoint_path), "run_dir": str(run_dir)}
+    state_dict = model.state_dict()
+    torch.save({"model_state": state_dict, "config": config}, checkpoint_path)
+    result: dict[str, object] = {
+        "checkpoint": str(checkpoint_path),
+        "run_dir": str(run_dir),
+        "run_stage": str(config["run"].get("stage", "smoke")),
+    }
     if best_path.exists():
         result["best_checkpoint"] = str(best_path)
+    if _should_write_artifact_after_train(config):
+        artifact_path = run_dir / str(config["export"]["artifact_name"])
+        _quant_obj, export_stats = write_quantized_artifact(
+            state_dict,
+            artifact_path,
+            keep_float_max_numel=int(config["export"]["keep_float_max_numel"]),
+            zlib_level=int(config["export"]["zlib_level"]),
+        )
+        budget_bytes = int(config["export"]["artifact_budget_bytes"])
+        over_budget = int(export_stats["artifact_bytes"]) > budget_bytes
+        export_result = {
+            "artifact_path": str(artifact_path),
+            "artifact_bytes": int(export_stats["artifact_bytes"]),
+            "artifact_raw_bytes": int(export_stats["raw_bytes"]),
+            "payload_bytes": int(export_stats["payload_bytes"]),
+            "baseline_tensor_bytes": int(export_stats["baseline_tensor_bytes"]),
+            "param_count": int(export_stats["param_count"]),
+            "budget_bytes": budget_bytes,
+            "within_budget": not over_budget,
+            "over_budget": over_budget,
+        }
+        logger.write_json("export_stats.json", export_result)
+        logger.log(
+            "artifact "
+            f"bytes:{export_result['artifact_bytes']} raw:{export_result['artifact_raw_bytes']} "
+            f"budget:{budget_bytes} within_budget:{export_result['within_budget']}"
+        )
+        logger.event("artifact_export", **export_result)
+        result["export"] = export_result
+        if over_budget and bool(config["export"]["fail_if_over_budget"]):
+            logger.write_json("train_result.json", result)
+            raise RuntimeError(
+                f"Artifact exceeds budget: {export_result['artifact_bytes']} > {budget_bytes} bytes"
+            )
     logger.write_json("train_result.json", result)
     return result
