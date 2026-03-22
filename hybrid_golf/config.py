@@ -36,6 +36,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "tie_embeddings": True,
         "use_factor_embed": False,
         "embed_dim": 96,
+        "num_unique_attn": 0,
+        "num_unique_mlp": 0,
+        "normformer_lite": False,
+        "depth_aware_init": False,
+        "recurrent_passes": 1,
+        "recurrent_gates": True,
+        "layer_modulation": True,
+        "depth_aware_residuals": True,
+        "pass_modulation": False,
+        "pass_q_gain": False,
+        "low_rank_deltas": False,
+        "delta_rank": 4,
+        "delta_init_scale": 0.05,
+        "logit_delta_rank": 0,
+        "logit_delta_init_scale": 0.05,
+        "pass_gate_init": 1.0,
+        "linear_impl": "dense",
+        "bitlinear_targets": "none",
+        "bitlinear_group_size": 0,
+        "restore_control_tensors_fp32": True,
         "rope_base": 10000.0,
         "logit_softcap": 30.0,
         "writable_rank": 4,
@@ -51,11 +71,31 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "seq_len": 64,
         "lr": 3e-4,
         "weight_decay": 0.01,
+        "optimizer": "adamw",
+        "embed_lr": 3e-4,
+        "head_lr": 3e-4,
+        "matrix_lr": 3e-4,
+        "scalar_lr": 3e-4,
+        "muon_momentum": 0.95,
+        "muon_backend_steps": 5,
+        "muon_momentum_warmup_start": 0.85,
+        "muon_momentum_warmup_steps": 500,
         "warmup_steps": 8,
         "grad_clip_norm": 1.0,
         "train_log_every": 10,
         "val_every": 0,
         "max_wallclock_seconds": 0.0,
+        "projection_qat_enabled": False,
+        "qat_start_frac": 0.8,
+        "qat_every_steps": 4,
+        "qat_lr_scale": 0.25,
+        "compression_reg_weight": 0.0,
+        "compression_reg_start_frac": 0.7,
+        "compression_reg_every_steps": 1,
+        "swa_enabled": False,
+        "swa_start_frac": 0.8,
+        "swa_every": 50,
+        "restore_best_val_checkpoint": False,
     },
     "experts": {
         "enable_ngram": True,
@@ -104,15 +144,26 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "export": {
         "artifact_name": "model.int8.ptz",
         "keep_float_max_numel": 4096,
+        "keep_float_policy": "small_and_control",
+        "quant_scheme": "mixed_v1",
+        "budget_mode": "submission_total",
         "zlib_level": 9,
         "write_after_train": False,
-        "artifact_budget_bytes": 16_777_216,
+        "artifact_budget_bytes": 16_000_000,
         "fail_if_over_budget": False,
     },
 }
 
 
 REQUIRED_TOP_LEVEL_KEYS = tuple(DEFAULT_CONFIG.keys())
+
+
+def load_raw_config_file(path: str | Path) -> dict[str, Any]:
+    config_path = Path(path)
+    loaded = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Config root must be a JSON object: {config_path}")
+    return loaded
 
 
 def deep_merge(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
@@ -176,11 +227,28 @@ def ensure_required_sections(config: dict[str, Any]) -> dict[str, Any]:
     return resolved
 
 
+def resolve_config_inheritance(path: str | Path, _seen: set[Path] | None = None) -> dict[str, Any]:
+    config_path = Path(path).resolve()
+    seen = set() if _seen is None else _seen
+    if config_path in seen:
+        cycle = " -> ".join(str(item) for item in (*seen, config_path))
+        raise ValueError(f"Config extends cycle detected: {cycle}")
+    seen.add(config_path)
+    loaded = load_raw_config_file(config_path)
+    extends_value = loaded.pop("extends", None)
+    if extends_value is None:
+        return loaded
+    if not isinstance(extends_value, str) or not extends_value.strip():
+        raise ValueError(f"Config 'extends' must be a non-empty string: {config_path}")
+    parent_path = Path(extends_value)
+    if not parent_path.is_absolute():
+        parent_path = (config_path.parent / parent_path).resolve()
+    parent = resolve_config_inheritance(parent_path, seen)
+    return deep_merge(parent, loaded)
+
+
 def load_config_file(path: str | Path, overrides: list[str] | None = None) -> dict[str, Any]:
-    config_path = Path(path)
-    loaded = json.loads(config_path.read_text(encoding="utf-8"))
-    if not isinstance(loaded, dict):
-        raise ValueError(f"Config root must be a JSON object: {config_path}")
+    loaded = resolve_config_inheritance(path)
     config = ensure_required_sections(deep_merge(DEFAULT_CONFIG, loaded))
     if overrides:
         config = ensure_required_sections(apply_overrides(config, overrides))

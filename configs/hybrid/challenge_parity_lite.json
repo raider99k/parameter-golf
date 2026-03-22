@@ -9,7 +9,7 @@
   "experts": {
     "enable_ngram": false,
     "enable_pointer": false,
-    "enable_doc_bias": true
+    "enable_doc_bias": false
   },
   "adaptation": {
     "meta_enabled": false,
@@ -28,7 +28,10 @@
   },
   "export": {
     "write_after_train": true,
-    "artifact_budget_bytes": 16777216,
+    "artifact_budget_bytes": 16000000,
+    "budget_mode": "submission_total",
+    "quant_scheme": "mixed_v1",
+    "keep_float_policy": "small_and_control",
     "fail_if_over_budget": true
   }
 }

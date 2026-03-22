@@ -1,0 +1,9 @@
+{
+  "extends": "challenge_parity.json",
+  "run": {
+    "id": "challenge_parity_doc_bias"
+  },
+  "experts": {
+    "enable_doc_bias": true
+  }
+}

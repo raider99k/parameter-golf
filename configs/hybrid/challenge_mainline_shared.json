@@ -1,0 +1,73 @@
+{
+  "run": {
+    "id": "challenge_mainline_shared",
+    "stage": "proxy"
+  },
+  "data": {
+    "val_tokens_limit": 131072
+  },
+  "model": {
+    "vocab_size": 1024,
+    "num_layers": 10,
+    "model_dim": 320,
+    "num_heads": 8,
+    "num_kv_heads": 4,
+    "mlp_mult": 2,
+    "tie_embeddings": true,
+    "use_factor_embed": true,
+    "embed_dim": 192,
+    "num_unique_attn": 6,
+    "num_unique_mlp": 6,
+    "normformer_lite": true,
+    "depth_aware_init": true,
+    "writable_rank": 4,
+    "writable_blocks": 2,
+    "recurrent_top_block": false
+  },
+  "train": {
+    "iterations": 1000000,
+    "batch_tokens": 16384,
+    "seq_len": 512,
+    "lr": 0.0005,
+    "optimizer": "muon_split",
+    "embed_lr": 0.0005,
+    "head_lr": 0.0005,
+    "matrix_lr": 0.0004,
+    "scalar_lr": 0.0004,
+    "warmup_steps": 64,
+    "train_log_every": 100,
+    "val_every": 0,
+    "max_wallclock_seconds": 540,
+    "swa_enabled": true,
+    "swa_start_frac": 0.8,
+    "swa_every": 200
+  },
+  "experts": {
+    "enable_ngram": false,
+    "enable_pointer": false,
+    "enable_doc_bias": false
+  },
+  "adaptation": {
+    "meta_enabled": false,
+    "strict_commit_steps": 0,
+    "exploratory_prefix_steps": 0,
+    "exploratory_persist_across_docs": false
+  },
+  "eval": {
+    "policy": "strict_causal",
+    "score_tokens": 1024,
+    "adapt_tokens": 3072,
+    "window_tokens": 0,
+    "documentwise": false,
+    "adaptive_extra_pass": false,
+    "write_block_logs": false
+  },
+  "export": {
+    "write_after_train": true,
+    "artifact_budget_bytes": 16000000,
+    "budget_mode": "submission_total",
+    "quant_scheme": "mixed_v1",
+    "keep_float_policy": "small_and_control",
+    "fail_if_over_budget": true
+  }
+}

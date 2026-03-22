@@ -10,6 +10,11 @@ from typing import Any
 import numpy as np
 import torch
 
+SUBMISSION_CODE_PATTERNS = (
+    "hybrid_golf/*.py",
+    "scripts/hg_eval.py",
+)
+
 
 def seed_everything(seed: int) -> None:
     random.seed(seed)
@@ -46,6 +51,57 @@ def build_run_dir(config: dict[str, Any]) -> Path:
     path = root / run_id
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def resolve_submission_code_paths() -> list[Path]:
+    root = repo_root()
+    paths: set[Path] = set()
+    for pattern in SUBMISSION_CODE_PATTERNS:
+        for path in root.glob(pattern):
+            if path.is_file():
+                paths.add(path.resolve())
+    return sorted(paths)
+
+
+def count_submission_code_bytes() -> tuple[int, list[str]]:
+    root = repo_root()
+    paths = resolve_submission_code_paths()
+    return (
+        sum(int(path.stat().st_size) for path in paths),
+        [str(path.relative_to(root)).replace("\\", "/") for path in paths],
+    )
+
+
+def build_submission_size_metrics(
+    artifact_bytes: int,
+    budget_bytes: int,
+    budget_mode: str,
+) -> dict[str, Any]:
+    counted_code_bytes, counted_code_files = count_submission_code_bytes()
+    submission_total_bytes = int(artifact_bytes) + counted_code_bytes
+    budget_mode_normalized = str(budget_mode).strip().lower()
+    if budget_mode_normalized == "artifact_only":
+        budgeted_bytes = int(artifact_bytes)
+    elif budget_mode_normalized == "submission_total":
+        budgeted_bytes = submission_total_bytes
+    else:
+        raise ValueError(f"Unsupported budget mode: {budget_mode!r}")
+    within_budget = budgeted_bytes <= int(budget_bytes)
+    return {
+        "model_artifact_bytes": int(artifact_bytes),
+        "counted_code_bytes": counted_code_bytes,
+        "counted_code_files": counted_code_files,
+        "submission_total_bytes": submission_total_bytes,
+        "budget_bytes": int(budget_bytes),
+        "budget_mode": budget_mode_normalized,
+        "budgeted_bytes": budgeted_bytes,
+        "within_budget": within_budget,
+        "over_budget": not within_budget,
+    }
 
 
 @dataclass

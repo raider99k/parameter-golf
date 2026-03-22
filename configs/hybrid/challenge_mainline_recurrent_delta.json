@@ -1,0 +1,17 @@
+{
+  "extends": "challenge_mainline_shared_qat.json",
+  "run": {
+    "id": "challenge_mainline_recurrent_delta"
+  },
+  "model": {
+    "recurrent_passes": 2,
+    "recurrent_gates": true,
+    "layer_modulation": true,
+    "depth_aware_residuals": true,
+    "pass_modulation": true,
+    "pass_q_gain": true,
+    "low_rank_deltas": true,
+    "delta_rank": 4,
+    "logit_delta_rank": 16
+  }
+}

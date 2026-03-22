@@ -1,10 +1,39 @@
 {
   "run": {
-    "id": "challenge_parity",
-    "stage": "submission_candidate"
+    "id": "challenge_mainline_base",
+    "stage": "proxy"
   },
   "data": {
-    "val_tokens_limit": 0
+    "val_tokens_limit": 131072
+  },
+  "model": {
+    "vocab_size": 1024,
+    "num_layers": 10,
+    "model_dim": 320,
+    "num_heads": 8,
+    "num_kv_heads": 4,
+    "mlp_mult": 2,
+    "tie_embeddings": true,
+    "use_factor_embed": false,
+    "embed_dim": 320,
+    "num_unique_attn": 0,
+    "num_unique_mlp": 0,
+    "normformer_lite": false,
+    "depth_aware_init": false,
+    "writable_rank": 4,
+    "writable_blocks": 2,
+    "recurrent_top_block": false
+  },
+  "train": {
+    "iterations": 1000000,
+    "batch_tokens": 16384,
+    "seq_len": 512,
+    "lr": 0.0005,
+    "optimizer": "adamw",
+    "warmup_steps": 64,
+    "train_log_every": 100,
+    "val_every": 0,
+    "max_wallclock_seconds": 540
   },
   "experts": {
     "enable_ngram": false,

@@ -13,7 +13,7 @@ from .experts import build_experts
 from .export import load_quantized_artifact, write_quantized_artifact
 from .model import HybridGPT, build_model
 from .policies import build_policy
-from .runtime import RunLogger, build_run_dir, resolve_autocast_dtype, resolve_device
+from .runtime import RunLogger, build_run_dir, build_submission_size_metrics, resolve_autocast_dtype, resolve_device
 from .tokenizers import ByteAccounting, load_tokenizer
 
 
@@ -178,12 +178,25 @@ def evaluate_checkpoint(
             artifact_path,
             keep_float_max_numel=int(config["export"]["keep_float_max_numel"]),
             zlib_level=int(config["export"]["zlib_level"]),
+            quant_scheme=str(config["export"]["quant_scheme"]),
+            keep_float_policy=str(config["export"]["keep_float_policy"]),
+            bitlinear_group_size=int(config["model"]["bitlinear_group_size"]),
         )
         roundtrip_model = build_model(config).to(device)
         roundtrip_model.load_state_dict(load_quantized_artifact(artifact_path), strict=True)
         roundtrip_result = evaluate_model(roundtrip_model, config, policy_name=policy_name, logger=logger)
+        budget_metrics = build_submission_size_metrics(
+            artifact_bytes=int(export_stats["artifact_bytes"]),
+            budget_bytes=int(config["export"]["artifact_budget_bytes"]),
+            budget_mode=str(config["export"]["budget_mode"]),
+        )
         roundtrip_result["artifact_bytes"] = int(export_stats["artifact_bytes"])
+        roundtrip_result["model_artifact_bytes"] = int(export_stats["artifact_bytes"])
         roundtrip_result["artifact_raw_bytes"] = int(export_stats["raw_bytes"])
+        roundtrip_result["payload_bytes"] = int(export_stats["payload_bytes"])
+        roundtrip_result["quant_scheme"] = str(config["export"]["quant_scheme"])
+        roundtrip_result["keep_float_policy"] = str(config["export"]["keep_float_policy"])
+        roundtrip_result.update(budget_metrics)
         logger.write_json("eval_result_roundtrip.json", roundtrip_result)
         return {"base": result, "roundtrip": roundtrip_result}
     return result
