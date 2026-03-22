@@ -69,6 +69,33 @@ def write_config(path: Path, train_glob: str, val_glob: str, tokenizer_path: str
     path.write_text(json.dumps(config), encoding="utf-8")
 
 
+def write_eval_config_with_wrong_model_dims(path: Path, train_glob: str, val_glob: str, tokenizer_path: str, output_root: str) -> None:
+    config = {
+        "run": {"id": "cli_smoke_eval_mismatch", "output_root": output_root, "device": "cpu"},
+        "data": {"train_glob": train_glob, "val_glob": val_glob, "val_tokens_limit": 0},
+        "tokenizer": {"path": tokenizer_path, "kind": "pure_byte", "bos_id": 1, "eos_id": 2},
+        "model": {
+            "vocab_size": 260,
+            "num_layers": 4,
+            "model_dim": 64,
+            "num_heads": 4,
+            "num_kv_heads": 2,
+            "mlp_mult": 2,
+            "tie_embeddings": True,
+            "use_factor_embed": False,
+            "embed_dim": 64,
+            "writable_rank": 4,
+            "writable_blocks": 2,
+            "recurrent_top_block": False,
+        },
+        "train": {"enabled": False},
+        "experts": {"enable_ngram": True, "enable_pointer": True, "enable_doc_bias": True},
+        "adaptation": {"meta_enabled": False, "strict_commit_steps": 1},
+        "eval": {"policy": "strict_causal", "score_tokens": 8, "adapt_tokens": 16, "documentwise": True},
+    }
+    path.write_text(json.dumps(config), encoding="utf-8")
+
+
 def run_cmd(args: list[str]) -> dict:
     proc = subprocess.run(args, cwd=REPO_ROOT, capture_output=True, text=True, check=True)
     stdout = proc.stdout.strip().splitlines()
@@ -94,10 +121,18 @@ def test_cli_train_and_eval_smoke(tmp_path):
         str(tokenizer_path),
         str(output_root),
     )
+    eval_config_path = tmp_path / "eval_config_wrong_model.json"
+    write_eval_config_with_wrong_model_dims(
+        eval_config_path,
+        str(train_dir / "fineweb_train_*.bin"),
+        str(val_dir / "fineweb_val_*.bin"),
+        str(tokenizer_path),
+        str(output_root),
+    )
     train_result = run_cmd([sys.executable, "scripts/hg_train.py", "--config", str(config_path)])
     checkpoint = train_result["checkpoint"]
     assert Path(checkpoint).is_file()
-    strict_eval = run_cmd([sys.executable, "scripts/hg_eval.py", "--config", str(config_path), "--checkpoint", checkpoint, "--policy", "strict"])
+    strict_eval = run_cmd([sys.executable, "scripts/hg_eval.py", "--config", str(eval_config_path), "--checkpoint", checkpoint, "--policy", "strict"])
     exploratory_eval = run_cmd([sys.executable, "scripts/hg_eval.py", "--config", str(config_path), "--checkpoint", checkpoint, "--policy", "exploratory"])
     assert "val_bpb" in strict_eval
     assert exploratory_eval["policy"]["legal_for_submission"] is False
