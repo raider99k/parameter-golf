@@ -68,6 +68,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "iterations": 50,
         "batch_tokens": 1024,
+        "grad_accum_steps": 1,
         "seq_len": 64,
         "lr": 3e-4,
         "weight_decay": 0.01,

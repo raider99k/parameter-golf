@@ -1,3 +1,6 @@
+import torch
+
+from hybrid_golf.data import TokenBatcher, write_data_shard
 from hybrid_golf.train import _schedule_progress_frac
 
 
@@ -24,3 +27,12 @@ def test_schedule_progress_prefers_farther_step_progress_when_ahead_of_wallclock
         max_wallclock_seconds=100.0,
     )
     assert progress == 0.8
+
+
+def test_token_batcher_splits_global_batch_across_grad_accum_steps(tmp_path):
+    shard_path = tmp_path / "fineweb_train_000000.bin"
+    write_data_shard(shard_path, torch.arange(0, 257, dtype=torch.int64))
+    batcher = TokenBatcher(str(shard_path), device=torch.device("cpu"))
+    x, y = batcher.next_batch(global_tokens=64, seq_len=16, grad_accum_steps=2)
+    assert x.shape == (2, 16)
+    assert y.shape == (2, 16)

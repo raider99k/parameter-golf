@@ -160,6 +160,7 @@ def run_training(config: dict[str, object]) -> dict[str, object]:
     model = build_model(config).to(device)
     batcher = TokenBatcher(config["data"]["train_glob"], device=device)
     optimizers, muon_optimizer = _build_optimizers(model, config)
+    grad_accum_steps = max(int(config["train"]["grad_accum_steps"]), 1)
     best_val: float | None = None
     best_path = run_dir / "best.pt"
     checkpoint_path = run_dir / "last.pt"
@@ -196,47 +197,55 @@ def run_training(config: dict[str, object]) -> dict[str, object]:
             and progress >= float(config["train"]["compression_reg_start_frac"])
             and step % max(int(config["train"]["compression_reg_every_steps"]), 1) == 0
         )
-        with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
-            if use_meta_step:
-                adapt_tokens = int(config["adaptation"]["meta_adapt_tokens"])
-                query_tokens = int(config["adaptation"]["meta_query_tokens"])
-                local = batcher.next_local_span(adapt_tokens + query_tokens + 1, same_file=False)
-                x_a = local[:adapt_tokens].reshape(1, adapt_tokens)
-                y_a = local[1 : adapt_tokens + 1].reshape(1, adapt_tokens)
-                x_b = local[adapt_tokens : adapt_tokens + query_tokens].reshape(1, query_tokens)
-                y_b = local[adapt_tokens + 1 : adapt_tokens + query_tokens + 1].reshape(1, query_tokens)
-                zero_state = init_writable_state(model, device)
-                loss_a = model(x_a, y_a, writable_state=zero_state)
-                adapted = adapt_writable_state(
-                    model,
-                    zero_state,
-                    x_a,
-                    y_a,
-                    steps=int(config["adaptation"]["meta_steps"]),
-                    clip=float(config["adaptation"]["inner_clip"]),
-                    doc_bias_lr=float(config["adaptation"]["doc_bias_lr"]),
-                    doc_bias_decay=float(config["adaptation"]["doc_bias_decay"]),
-                    create_graph=False,
-                    detach_result=False,
-                )
-                loss_b = model(x_b, y_b, writable_state=adapted)
-                loss = (
-                    float(config["adaptation"]["meta_loss_a_weight"]) * loss_a
-                    + float(config["adaptation"]["meta_loss_b_weight"]) * loss_b
-                )
-            else:
-                x, y = batcher.next_batch(int(config["train"]["batch_tokens"]), int(config["train"]["seq_len"]))
-                loss = model(x, y)
-            if compression_reg_active:
-                reg = compute_export_grid_regularizer(
-                    model,
-                    quant_scheme=str(config["export"]["quant_scheme"]),
-                    keep_float_max_numel=int(config["export"]["keep_float_max_numel"]),
-                    keep_float_policy=str(config["export"]["keep_float_policy"]),
-                    bitlinear_group_size=int(config["model"]["bitlinear_group_size"]),
-                )
-                loss = loss + float(config["train"]["compression_reg_weight"]) * reg.to(dtype=loss.dtype)
-        loss.backward()
+        train_loss = torch.zeros((), device=device, dtype=torch.float32)
+        for _micro_step in range(grad_accum_steps):
+            with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=autocast_dtype is not None):
+                if use_meta_step:
+                    adapt_tokens = int(config["adaptation"]["meta_adapt_tokens"])
+                    query_tokens = int(config["adaptation"]["meta_query_tokens"])
+                    local = batcher.next_local_span(adapt_tokens + query_tokens + 1, same_file=False)
+                    x_a = local[:adapt_tokens].reshape(1, adapt_tokens)
+                    y_a = local[1 : adapt_tokens + 1].reshape(1, adapt_tokens)
+                    x_b = local[adapt_tokens : adapt_tokens + query_tokens].reshape(1, query_tokens)
+                    y_b = local[adapt_tokens + 1 : adapt_tokens + query_tokens + 1].reshape(1, query_tokens)
+                    zero_state = init_writable_state(model, device)
+                    loss_a = model(x_a, y_a, writable_state=zero_state)
+                    adapted = adapt_writable_state(
+                        model,
+                        zero_state,
+                        x_a,
+                        y_a,
+                        steps=int(config["adaptation"]["meta_steps"]),
+                        clip=float(config["adaptation"]["inner_clip"]),
+                        doc_bias_lr=float(config["adaptation"]["doc_bias_lr"]),
+                        doc_bias_decay=float(config["adaptation"]["doc_bias_decay"]),
+                        create_graph=False,
+                        detach_result=False,
+                    )
+                    loss_b = model(x_b, y_b, writable_state=adapted)
+                    loss = (
+                        float(config["adaptation"]["meta_loss_a_weight"]) * loss_a
+                        + float(config["adaptation"]["meta_loss_b_weight"]) * loss_b
+                    )
+                else:
+                    x, y = batcher.next_batch(
+                        int(config["train"]["batch_tokens"]),
+                        int(config["train"]["seq_len"]),
+                        grad_accum_steps=grad_accum_steps,
+                    )
+                    loss = model(x, y)
+                if compression_reg_active:
+                    reg = compute_export_grid_regularizer(
+                        model,
+                        quant_scheme=str(config["export"]["quant_scheme"]),
+                        keep_float_max_numel=int(config["export"]["keep_float_max_numel"]),
+                        keep_float_policy=str(config["export"]["keep_float_policy"]),
+                        bitlinear_group_size=int(config["model"]["bitlinear_group_size"]),
+                    )
+                    loss = loss + float(config["train"]["compression_reg_weight"]) * reg.to(dtype=loss.dtype)
+            train_loss = train_loss + loss.detach().to(dtype=torch.float32)
+            (loss / grad_accum_steps).backward()
+        train_loss = train_loss / grad_accum_steps
         clip_norm = float(config["train"]["grad_clip_norm"])
         if clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
@@ -254,13 +263,13 @@ def run_training(config: dict[str, object]) -> dict[str, object]:
         if step == 0 or (step + 1) % int(config["train"]["train_log_every"]) == 0 or step + 1 == int(config["train"]["iterations"]):
             elapsed_ms = 1000.0 * (time.perf_counter() - started)
             logger.log(
-                f"step:{step + 1}/{config['train']['iterations']} loss:{float(loss.item()):.4f} "
+                f"step:{step + 1}/{config['train']['iterations']} loss:{float(train_loss.item()):.4f} "
                 f"meta:{use_meta_step} train_time:{elapsed_ms:.0f}ms"
             )
             logger.event(
                 "train_step",
                 step=step + 1,
-                loss=float(loss.item()),
+                loss=float(train_loss.item()),
                 meta=bool(use_meta_step),
                 train_time_ms=float(elapsed_ms),
             )

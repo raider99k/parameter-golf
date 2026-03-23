@@ -120,8 +120,16 @@ class TokenBatcher:
     def __post_init__(self) -> None:
         self.stream = TokenStream(self.pattern)
 
-    def next_batch(self, global_tokens: int, seq_len: int) -> tuple[Tensor, Tensor]:
-        local_tokens = global_tokens // self.world_size
+    def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int = 1) -> tuple[Tensor, Tensor]:
+        if grad_accum_steps <= 0:
+            raise ValueError(f"grad_accum_steps must be positive, got {grad_accum_steps}")
+        denom = self.world_size * grad_accum_steps
+        if global_tokens % denom != 0:
+            raise ValueError(
+                f"batch_tokens must divide world_size * grad_accum_steps, got {global_tokens}, "
+                f"{self.world_size}, {grad_accum_steps}"
+            )
+        local_tokens = global_tokens // denom
         if local_tokens % seq_len != 0:
             raise ValueError(f"batch_tokens per rank must divide seq_len, got {local_tokens} and {seq_len}")
         per_rank_span = local_tokens + 1

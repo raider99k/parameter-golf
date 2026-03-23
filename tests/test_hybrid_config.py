@@ -24,6 +24,7 @@ def test_default_config_exposes_mainline_submission_fields():
     assert DEFAULT_CONFIG["model"]["linear_impl"] == "dense"
     assert DEFAULT_CONFIG["model"]["bitlinear_targets"] == "none"
     assert DEFAULT_CONFIG["train"]["optimizer"] == "adamw"
+    assert DEFAULT_CONFIG["train"]["grad_accum_steps"] == 1
     assert DEFAULT_CONFIG["export"]["artifact_budget_bytes"] == 16_000_000
     assert DEFAULT_CONFIG["export"]["budget_mode"] == "submission_total"
 
