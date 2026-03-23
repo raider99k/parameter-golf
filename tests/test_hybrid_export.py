@@ -80,6 +80,8 @@ def test_mixed_v2_roundtrip_preserves_bitlinear_latents(tmp_path):
         export={"quant_scheme": "mixed_v2"},
     )
     model = build_model(config).to("cpu")
+    x = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
+    logits_before = model.forward_logits(x)
     artifact_path = tmp_path / "model.mixed_v2.ptz"
     _quant_obj, _stats = write_quantized_artifact(
         model.state_dict(),
@@ -94,9 +96,10 @@ def test_mixed_v2_roundtrip_preserves_bitlinear_latents(tmp_path):
     ternary_names = [name for name, meta in unpacked["qmeta"].items() if meta["scheme"].startswith("ternary_packed")]
     roundtrip_model = build_model(config).to("cpu")
     roundtrip_model.load_state_dict(load_quantized_artifact(artifact_path), strict=True)
-    x = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
+    logits_after = roundtrip_model.forward_logits(x)
     assert ternary_names
-    assert roundtrip_model.forward_logits(x).shape == (1, 4, 260)
+    assert logits_after.shape == (1, 4, 260)
+    assert (logits_before - logits_after).abs().max().item() < 0.05
 
 
 def test_mixed_v2_preserves_group_size_for_non_divisible_bitlinear_widths(tmp_path):
@@ -128,7 +131,13 @@ def test_mixed_v2_preserves_group_size_for_non_divisible_bitlinear_widths(tmp_pa
         for meta in unpacked["qmeta"].values()
         if meta["scheme"] == "ternary_packed_group"
     }
+    x = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
+    logits_before = model.forward_logits(x)
+    roundtrip_model = build_model(config).to("cpu")
+    roundtrip_model.load_state_dict(load_quantized_artifact(artifact_path), strict=True)
+    logits_after = roundtrip_model.forward_logits(x)
     assert ternary_group_sizes == {64}
+    assert (logits_before - logits_after).abs().max().item() < 0.05
 
 
 def test_submission_total_budget_metrics_include_code_bytes():

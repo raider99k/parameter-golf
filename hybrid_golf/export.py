@@ -220,6 +220,23 @@ def dequantize_named_tensor(q: Tensor, scale: Tensor, dtype: torch.dtype, meta: 
         group_size = int(meta.get("group_size", 0))
         ternary = unpack_ternary(q, shape, "cpu").float()
         restored = apply_groupwise_row_scales(ternary, scale.float(), group_size)
+        # BitLinear modules re-quantize `weight_latent` on every forward pass, so the
+        # roundtrip loader must restore a latent tensor that reproduces `restored`
+        # after that second quantization step instead of storing the already-quantized
+        # effective weight directly.
+        if scale.ndim == 2 and scale.shape[1] > 1 and group_size > 0:
+            sparsity = torch.empty((ternary.shape[0], scale.shape[1]), dtype=torch.float32)
+            group_idx = 0
+            for start in range(0, ternary.shape[1], group_size):
+                end = min(start + group_size, ternary.shape[1])
+                sparsity[:, group_idx : group_idx + 1] = (
+                    ternary[:, start:end].abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
+                )
+                group_idx += 1
+            restored = restored / torch.repeat_interleave(sparsity, repeats=group_size, dim=1)[:, : ternary.shape[1]]
+        else:
+            sparsity = ternary.abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
+            restored = restored / sparsity
         return restored.to(dtype=dtype).contiguous()
     return dequantize_tensor(q, scale, dtype=dtype)
 
