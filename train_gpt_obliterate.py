@@ -1214,7 +1214,7 @@ def eval_val_obliterate(
     for score_start in range(local_target_start, local_target_end, stride):
         score_end = min(score_start + stride, local_target_end)
         ws = max(0, score_end - seq_len)
-        x_batch = val_tokens[ws:score_end].unsqueeze(0).to(device)
+        x_batch = val_tokens[ws:score_end].unsqueeze(0).to(device=device, dtype=torch.int64)
         hidden, logits = base_model.forward_hidden_logits(x_batch)
         hidden = hidden[0]
         logits = logits[0]
