@@ -27,7 +27,7 @@
   "train": {
     "iterations": 1000000,
     "batch_tokens": 131072,
-    "grad_accum_steps": 8,
+    "grad_accum_steps": 1,
     "seq_len": 512,
     "lr": 0.0005,
     "optimizer": "adamw",
