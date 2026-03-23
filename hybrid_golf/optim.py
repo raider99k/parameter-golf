@@ -5,6 +5,9 @@ import torch.distributed as dist
 from torch import Tensor
 
 
+_ZEROPOWER_COMPILED = False
+
+
 def _muon_work_dtype(device: torch.device) -> torch.dtype:
     return torch.bfloat16 if device.type == "cuda" else torch.float32
 
@@ -21,6 +24,14 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
         B = b * A + c * A @ A
         X = a * X + B @ X
     return X.T if transposed else X
+
+
+def maybe_enable_muon_compile(device: torch.device, enabled: bool) -> None:
+    global zeropower_via_newtonschulz5, _ZEROPOWER_COMPILED
+    if not enabled or device.type != "cuda" or _ZEROPOWER_COMPILED or not hasattr(torch, "compile"):
+        return
+    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5, dynamic=False, fullgraph=False)
+    _ZEROPOWER_COMPILED = True
 
 
 class Muon(torch.optim.Optimizer):

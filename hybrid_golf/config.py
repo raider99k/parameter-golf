@@ -73,6 +73,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "lr": 3e-4,
         "weight_decay": 0.01,
         "optimizer": "adamw",
+        "use_compile": True,
+        "compile_fullgraph": False,
         "embed_lr": 3e-4,
         "head_lr": 3e-4,
         "matrix_lr": 3e-4,

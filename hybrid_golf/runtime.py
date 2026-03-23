@@ -45,6 +45,32 @@ def resolve_autocast_dtype(device: torch.device, dtype_name: str) -> torch.dtype
     raise ValueError(f"Unsupported dtype setting: {dtype_name!r}")
 
 
+def configure_cuda_fast_math(device: torch.device) -> dict[str, bool]:
+    if device.type != "cuda":
+        return {
+            "cudnn": False,
+            "flash": False,
+            "mem_efficient": False,
+            "math": False,
+            "tf32": False,
+        }
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+
+    enable_cudnn_sdp(False)
+    enable_flash_sdp(True)
+    enable_mem_efficient_sdp(False)
+    enable_math_sdp(False)
+    return {
+        "cudnn": False,
+        "flash": True,
+        "mem_efficient": False,
+        "math": False,
+        "tf32": True,
+    }
+
+
 def build_run_dir(config: dict[str, Any]) -> Path:
     root = Path(config["run"]["output_root"])
     run_id = str(config["run"]["id"])

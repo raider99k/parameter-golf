@@ -9,11 +9,12 @@ from .data import TokenBatcher
 from .evaluate import evaluate_model
 from .export import compute_export_grid_regularizer, project_model_to_export_grid, write_quantized_artifact
 from .model import build_model
-from .optim import Muon
+from .optim import Muon, maybe_enable_muon_compile
 from .runtime import (
     RunLogger,
     build_run_dir,
     build_submission_size_metrics,
+    configure_cuda_fast_math,
     resolve_autocast_dtype,
     resolve_device,
     seed_everything,
@@ -67,16 +68,32 @@ def _set_lr_scale(optimizers: list[torch.optim.Optimizer], scale: float) -> None
             group["lr"] = float(group["base_lr"]) * scale
 
 
+def _make_adamw(
+    params: list[torch.nn.Parameter],
+    lr: float,
+    weight_decay: float,
+    device: torch.device,
+) -> torch.optim.Optimizer:
+    kwargs: dict[str, object] = {
+        "lr": float(lr),
+        "weight_decay": float(weight_decay),
+    }
+    if device.type == "cuda":
+        kwargs["fused"] = True
+    try:
+        return torch.optim.AdamW([{"params": params, "lr": float(lr), "base_lr": float(lr)}], **kwargs)
+    except (TypeError, RuntimeError):
+        kwargs.pop("fused", None)
+        return torch.optim.AdamW([{"params": params, "lr": float(lr), "base_lr": float(lr)}], **kwargs)
+
+
 def _build_optimizers(model: torch.nn.Module, config: dict[str, object]) -> tuple[list[torch.optim.Optimizer], Muon | None]:
     train_cfg = config["train"]
     optimizer_name = str(train_cfg["optimizer"]).strip().lower()
     weight_decay = float(train_cfg["weight_decay"])
+    device = next(model.parameters()).device
     if optimizer_name == "adamw":
-        optimizer = torch.optim.AdamW(
-            [{"params": list(model.parameters()), "lr": float(train_cfg["lr"]), "base_lr": float(train_cfg["lr"])}],
-            lr=float(train_cfg["lr"]),
-            weight_decay=weight_decay,
-        )
+        optimizer = _make_adamw(list(model.parameters()), float(train_cfg["lr"]), weight_decay, device)
         return [optimizer], None
     if optimizer_name not in {"muon", "muon_split"}:
         raise ValueError(f"Unsupported optimizer setting: {train_cfg['optimizer']!r}")
@@ -101,21 +118,9 @@ def _build_optimizers(model: torch.nn.Module, config: dict[str, object]) -> tupl
 
     optimizers: list[torch.optim.Optimizer] = []
     if embed_params:
-        optimizers.append(
-            torch.optim.AdamW(
-                [{"params": embed_params, "lr": float(train_cfg["embed_lr"]), "base_lr": float(train_cfg["embed_lr"])}],
-                lr=float(train_cfg["embed_lr"]),
-                weight_decay=weight_decay,
-            )
-        )
+        optimizers.append(_make_adamw(embed_params, float(train_cfg["embed_lr"]), weight_decay, device))
     if head_params:
-        optimizers.append(
-            torch.optim.AdamW(
-                [{"params": head_params, "lr": float(train_cfg["head_lr"]), "base_lr": float(train_cfg["head_lr"])}],
-                lr=float(train_cfg["head_lr"]),
-                weight_decay=weight_decay,
-            )
-        )
+        optimizers.append(_make_adamw(head_params, float(train_cfg["head_lr"]), weight_decay, device))
     muon_optimizer: Muon | None = None
     if matrix_params:
         muon_optimizer = Muon(
@@ -127,13 +132,7 @@ def _build_optimizers(model: torch.nn.Module, config: dict[str, object]) -> tupl
         )
         optimizers.append(muon_optimizer)
     if scalar_params:
-        optimizers.append(
-            torch.optim.AdamW(
-                [{"params": scalar_params, "lr": float(train_cfg["scalar_lr"]), "base_lr": float(train_cfg["scalar_lr"])}],
-                lr=float(train_cfg["scalar_lr"]),
-                weight_decay=weight_decay,
-            )
-        )
+        optimizers.append(_make_adamw(scalar_params, float(train_cfg["scalar_lr"]), weight_decay, device))
     return optimizers, muon_optimizer
 
 
@@ -157,9 +156,15 @@ def run_training(config: dict[str, object]) -> dict[str, object]:
     logger.write_json("resolved_config.json", config)
     device = resolve_device(str(config["run"]["device"]))
     autocast_dtype = resolve_autocast_dtype(device, str(config["run"]["dtype"]))
-    model = build_model(config).to(device)
+    fast_math = configure_cuda_fast_math(device)
+    maybe_enable_muon_compile(device, bool(config["train"]["use_compile"]))
+    base_model = build_model(config).to(device)
+    if device.type == "cuda" and bool(config["train"]["use_compile"]) and hasattr(torch, "compile"):
+        model = torch.compile(base_model, dynamic=False, fullgraph=bool(config["train"]["compile_fullgraph"]))
+    else:
+        model = base_model
     batcher = TokenBatcher(config["data"]["train_glob"], device=device)
-    optimizers, muon_optimizer = _build_optimizers(model, config)
+    optimizers, muon_optimizer = _build_optimizers(base_model, config)
     grad_accum_steps = max(int(config["train"]["grad_accum_steps"]), 1)
     best_val: float | None = None
     best_path = run_dir / "best.pt"
@@ -170,6 +175,14 @@ def run_training(config: dict[str, object]) -> dict[str, object]:
     swa_count = 0
     model.train()
     final_step = 0
+    logger.log(
+        f"fast_math:cudnn={fast_math['cudnn']} flash={fast_math['flash']} "
+        f"mem_efficient={fast_math['mem_efficient']} math={fast_math['math']} tf32={fast_math['tf32']}"
+    )
+    logger.log(
+        f"compile:enabled={bool(device.type == 'cuda' and bool(config['train']['use_compile']) and hasattr(torch, 'compile'))} "
+        f"fullgraph={bool(config['train']['compile_fullgraph'])} grad_accum_steps:{grad_accum_steps}"
+    )
 
     for step in range(int(config["train"]["iterations"])):
         elapsed = time.perf_counter() - started
@@ -208,10 +221,10 @@ def run_training(config: dict[str, object]) -> dict[str, object]:
                     y_a = local[1 : adapt_tokens + 1].reshape(1, adapt_tokens)
                     x_b = local[adapt_tokens : adapt_tokens + query_tokens].reshape(1, query_tokens)
                     y_b = local[adapt_tokens + 1 : adapt_tokens + query_tokens + 1].reshape(1, query_tokens)
-                    zero_state = init_writable_state(model, device)
-                    loss_a = model(x_a, y_a, writable_state=zero_state)
+                    zero_state = init_writable_state(base_model, device)
+                    loss_a = base_model(x_a, y_a, writable_state=zero_state)
                     adapted = adapt_writable_state(
-                        model,
+                        base_model,
                         zero_state,
                         x_a,
                         y_a,
@@ -222,7 +235,7 @@ def run_training(config: dict[str, object]) -> dict[str, object]:
                         create_graph=False,
                         detach_result=False,
                     )
-                    loss_b = model(x_b, y_b, writable_state=adapted)
+                    loss_b = base_model(x_b, y_b, writable_state=adapted)
                     loss = (
                         float(config["adaptation"]["meta_loss_a_weight"]) * loss_a
                         + float(config["adaptation"]["meta_loss_b_weight"]) * loss_b
@@ -236,7 +249,7 @@ def run_training(config: dict[str, object]) -> dict[str, object]:
                     loss = model(x, y)
                 if compression_reg_active:
                     reg = compute_export_grid_regularizer(
-                        model,
+                        base_model,
                         quant_scheme=str(config["export"]["quant_scheme"]),
                         keep_float_max_numel=int(config["export"]["keep_float_max_numel"]),
                         keep_float_policy=str(config["export"]["keep_float_policy"]),
@@ -248,11 +261,11 @@ def run_training(config: dict[str, object]) -> dict[str, object]:
         train_loss = train_loss / grad_accum_steps
         clip_norm = float(config["train"]["grad_clip_norm"])
         if clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), clip_norm)
         _step_all(optimizers)
         if qat_active and (step + 1) % max(int(config["train"]["qat_every_steps"]), 1) == 0:
             project_model_to_export_grid(
-                model,
+                base_model,
                 quant_scheme=str(config["export"]["quant_scheme"]),
                 keep_float_max_numel=int(config["export"]["keep_float_max_numel"]),
                 keep_float_policy=str(config["export"]["keep_float_policy"]),
@@ -275,7 +288,7 @@ def run_training(config: dict[str, object]) -> dict[str, object]:
             )
 
         if bool(config["train"]["swa_enabled"]) and progress >= float(config["train"]["swa_start_frac"]) and (step + 1) % max(int(config["train"]["swa_every"]), 1) == 0:
-            current_state = {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+            current_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
             if swa_state is None:
                 swa_state = current_state
             else:
@@ -285,7 +298,7 @@ def run_training(config: dict[str, object]) -> dict[str, object]:
 
         val_every = int(config["train"]["val_every"])
         if val_every > 0 and ((step + 1) % val_every == 0):
-            val_result = evaluate_model(model, config, policy_name=str(config["eval"]["policy"]), logger=logger)
+            val_result = evaluate_model(base_model, config, policy_name=str(config["eval"]["policy"]), logger=logger)
             logger.log(
                 f"val step:{step + 1} val_loss:{val_result['val_loss']:.4f} val_bpb:{val_result['val_bpb']:.4f} "
                 f"policy:{val_result['policy']['policy']}"
@@ -293,19 +306,19 @@ def run_training(config: dict[str, object]) -> dict[str, object]:
             logger.write_json("latest_val.json", val_result)
             if best_val is None or float(val_result["val_bpb"]) < best_val:
                 best_val = float(val_result["val_bpb"])
-                torch.save({"model_state": model.state_dict(), "config": config, "step": step + 1}, best_path)
+                torch.save({"model_state": base_model.state_dict(), "config": config, "step": step + 1}, best_path)
 
     if bool(config["train"]["restore_best_val_checkpoint"]) and best_path.exists():
         best_checkpoint = torch.load(best_path, map_location="cpu")
-        model.load_state_dict(best_checkpoint["model_state"], strict=True)
+        base_model.load_state_dict(best_checkpoint["model_state"], strict=True)
     elif bool(config["train"]["swa_enabled"]) and swa_state is not None and swa_count > 1:
         avg_state = {
-            name: (tensor / swa_count).to(dtype=model.state_dict()[name].dtype)
+            name: (tensor / swa_count).to(dtype=base_model.state_dict()[name].dtype)
             for name, tensor in swa_state.items()
         }
-        model.load_state_dict(avg_state, strict=True)
+        base_model.load_state_dict(avg_state, strict=True)
 
-    state_dict = model.state_dict()
+    state_dict = base_model.state_dict()
     torch.save({"model_state": state_dict, "config": config, "step": final_step}, checkpoint_path)
     elapsed_ms = 1000.0 * (time.perf_counter() - started)
     result: dict[str, object] = {
