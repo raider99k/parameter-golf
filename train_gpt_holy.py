@@ -1219,11 +1219,6 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
-    embedding_param_names = {"tok_emb.weight"}
-    if base_model.bigram is not None:
-        embedding_param_names.add("bigram.embed.weight")
-    if base_model.ve_shared is not None:
-        embedding_param_names.add("ve_shared.embed.weight")
     matrix_params: list[Tensor] = []
     scalar_params: list[Tensor] = []
     seen = set()
@@ -1231,12 +1226,32 @@ def main() -> None:
         if not p.requires_grad or id(p) in seen:
             continue
         seen.add(id(p))
-        if name in embedding_param_names or name.startswith("lm_head.") or name.startswith("mtp_heads."):
+        if name in {"tok_emb.weight", "bigram.embed.weight", "ve_shared.embed.weight"}:
+            continue
+        if name.startswith("lm_head.") or name.startswith("mtp_heads."):
             continue
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
             matrix_params.append(p)
         else:
             scalar_params.append(p)
+    scalar_params.append(base_model.smear.gate)
+    if base_model.bigram is not None:
+        scalar_params.append(base_model.bigram.scale)
+    token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
+    if base_model.bigram is not None:
+        tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
+        if base_model.bigram.proj is not None:
+            matrix_params.append(base_model.bigram.proj.weight)
+    if base_model.ve_shared is not None:
+        tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
+        if base_model.ve_shared.proj is not None:
+            matrix_params.append(base_model.ve_shared.proj.weight)
+        scalar_params.append(base_model.ve_shared.scale)
+        for s in base_model.ve_layer_scales:
+            scalar_params.append(s)
+    if base_model.value_residual:
+        scalar_params.append(base_model.value_residual_scales)
     optimizer_tok = torch.optim.AdamW(
         tok_params,
         betas=(args.beta1, args.beta2),
