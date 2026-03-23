@@ -99,6 +99,38 @@ def test_mixed_v2_roundtrip_preserves_bitlinear_latents(tmp_path):
     assert roundtrip_model.forward_logits(x).shape == (1, 4, 260)
 
 
+def test_mixed_v2_preserves_group_size_for_non_divisible_bitlinear_widths(tmp_path):
+    config = build_export_config(
+        model={
+            "model_dim": 72,
+            "num_heads": 4,
+            "num_kv_heads": 2,
+            "linear_impl": "bitlinear",
+            "bitlinear_targets": "mlp_only",
+            "bitlinear_group_size": 64,
+        },
+        export={"quant_scheme": "mixed_v2"},
+    )
+    model = build_model(config).to("cpu")
+    artifact_path = tmp_path / "model_nondivisible_group.mixed_v2.ptz"
+    _quant_obj, _stats = write_quantized_artifact(
+        model.state_dict(),
+        artifact_path,
+        keep_float_max_numel=int(config["export"]["keep_float_max_numel"]),
+        zlib_level=9,
+        quant_scheme=str(config["export"]["quant_scheme"]),
+        keep_float_policy=str(config["export"]["keep_float_policy"]),
+        bitlinear_group_size=int(config["model"]["bitlinear_group_size"]),
+    )
+    unpacked = unpack_quantized(zlib.decompress(artifact_path.read_bytes()))
+    ternary_group_sizes = {
+        meta["group_size"]
+        for meta in unpacked["qmeta"].values()
+        if meta["scheme"] == "ternary_packed_group"
+    }
+    assert ternary_group_sizes == {64}
+
+
 def test_submission_total_budget_metrics_include_code_bytes():
     metrics = build_submission_size_metrics(artifact_bytes=1024, budget_bytes=1024, budget_mode="artifact_only")
     assert metrics["model_artifact_bytes"] == 1024

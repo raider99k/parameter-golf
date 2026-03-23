@@ -193,7 +193,7 @@ def quantize_named_float_tensor(
         packed = pack_ternary(ternary)
         if scale.ndim == 2 and scale.shape[1] > 1:
             qmeta["scheme"] = "ternary_packed_group"
-            qmeta["group_size"] = max(int(t.shape[1] // scale.shape[1]), 1)
+            qmeta["group_size"] = group_size
         return packed, scale, qmeta
     quant_bits = select_quant_bits(name, t, quant_scheme)
     if quant_bits == 8:
