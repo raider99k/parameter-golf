@@ -752,6 +752,7 @@ def eval_val(
 
         with torch.no_grad():
             with torch.autocast(device_type="cuda", dtype=LOW_PRECISION_DTYPE, enabled=True):
+                cudagraph_mark_step_begin()
                 batch_loss = model(x_full, y_full, loss_mask=mask)
 
         batch_token_count = float(score_end - score_start)
@@ -833,6 +834,15 @@ def torch_is_compiling() -> bool:
         except Exception:
             pass
     return False
+
+
+def cudagraph_mark_step_begin() -> None:
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and hasattr(compiler, "cudagraph_mark_step_begin"):
+        try:
+            compiler.cudagraph_mark_step_begin()
+        except Exception:
+            pass
 
 
 def bump_bitlinear_cache_version() -> None:
@@ -1927,6 +1937,7 @@ def adapt_fast_state(
         # Recompute the prefix loss from the exact state being adapted.
         # Cached outer losses are often detached from this internal clone,
         # which would make autograd.grad see an unused tensor.
+        cudagraph_mark_step_begin()
         loss = model(x_prefix, y_prefix, fast_state=state, loss_mask=loss_mask)
         grads = torch.autograd.grad(
             loss,
@@ -2403,6 +2414,7 @@ def main(argv: list[str] | None = None) -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=LOW_PRECISION_DTYPE, enabled=True):
+                    cudagraph_mark_step_begin()
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -2545,6 +2557,7 @@ def main(argv: list[str] | None = None) -> None:
                     for k, v in (zero_fast_state_template.items() if zero_fast_state_template is not None else ())
                 }
                 with torch.autocast(device_type="cuda", dtype=LOW_PRECISION_DTYPE, enabled=True):
+                    cudagraph_mark_step_begin()
                     loss_a = model(x_a, y_a, fast_state=zero_state)
                     fast_state_1 = adapt_fast_state_from_loss(
                         loss_a,
@@ -2565,6 +2578,7 @@ def main(argv: list[str] | None = None) -> None:
                             detach_result=False,
                             adapters=fast_adapters,
                         )
+                    cudagraph_mark_step_begin()
                     loss_b = model(x_b, y_b, fast_state=fast_state_1)
                     loss = args.train_meta_loss_a_weight * loss_a + args.train_meta_loss_b_weight * loss_b
 
@@ -2576,6 +2590,7 @@ def main(argv: list[str] | None = None) -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=LOW_PRECISION_DTYPE, enabled=True):
+                    cudagraph_mark_step_begin()
                     loss = model(x, y)
                 train_loss += loss.detach()
                 (loss * grad_scale).backward()
