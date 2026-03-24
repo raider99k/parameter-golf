@@ -80,6 +80,15 @@ def torch_is_compiling() -> bool:
             pass
     return False
 
+
+def cudagraph_mark_step_begin() -> None:
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and hasattr(compiler, "cudagraph_mark_step_begin"):
+        try:
+            compiler.cudagraph_mark_step_begin()
+        except Exception:
+            pass
+
 def _update_fast_runtime(args, base_model: nn.Module, step: int) -> None:
     FAST_RT.step = int(step)
     FAST_RT.total_layers = len(base_model.blocks)
@@ -424,6 +433,7 @@ def eval_val(
             x = local[:-1].reshape(-1, seq_len)
             y = local[1:].reshape(-1, seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                cudagraph_mark_step_begin()
                 batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
@@ -1148,6 +1158,7 @@ def eval_val_sliding(
                 x_batch[i, :wlen] = chunk[:-1]
                 y_batch[i, :wlen] = chunk[1:]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                cudagraph_mark_step_begin()
                 logits = compiled_logits(x_batch)
             nll = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)).float(),
@@ -1500,6 +1511,7 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    cudagraph_mark_step_begin()
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -1567,6 +1579,7 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                cudagraph_mark_step_begin()
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
