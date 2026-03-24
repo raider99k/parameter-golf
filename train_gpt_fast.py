@@ -32,6 +32,11 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
+try:
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+except ImportError:
+    sdpa_kernel = None
+    SDPBackend = None
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 class FastRuntimeState:
@@ -680,14 +685,16 @@ def attention_backend(q: Tensor, k: Tensor, v: Tensor, causal: bool = True, wind
         neg = torch.tensor(-torch.finfo(q_t.dtype).max, device=q_t.device, dtype=q_t.dtype)
         attn_mask = torch.where(allow, zero, neg)
         is_causal = False
-    y = F.scaled_dot_product_attention(
-        q_t,
-        k_t,
-        v_t,
+    sdpa_kwargs = dict(
         attn_mask=attn_mask,
         is_causal=is_causal,
         enable_gqa=(k_t.size(1) != q_t.size(1)),
     )
+    if attn_mask is not None and sdpa_kernel is not None and SDPBackend is not None:
+        with sdpa_kernel([SDPBackend.MATH]):
+            y = F.scaled_dot_product_attention(q_t, k_t, v_t, **sdpa_kwargs)
+    else:
+        y = F.scaled_dot_product_attention(q_t, k_t, v_t, **sdpa_kwargs)
     return y.transpose(1, 2).contiguous()
 
 class CausalSelfAttention(nn.Module):

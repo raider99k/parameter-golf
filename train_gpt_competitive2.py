@@ -2185,6 +2185,9 @@ def main(argv: list[str] | None = None) -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        # Warmup is intended to prime compiled paths without consuming the measured
+        # wallclock budget for the real run.
+        wallclock_start = time.perf_counter()
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -2202,6 +2205,8 @@ def main(argv: list[str] | None = None) -> None:
     step = 0
     while True:
         elapsed_ms = wallclock_elapsed_ms()
+        if stop_after_step is None and effective_budget_ms is not None and elapsed_ms >= effective_budget_ms:
+            stop_after_step = step
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
         should_validate_by_step = (
