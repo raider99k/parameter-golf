@@ -64,6 +64,22 @@ def _device_supports_fp8() -> bool:
         and torch.cuda.get_device_capability()[0] >= 9
     )
 
+
+def torch_is_compiling() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and hasattr(compiler, "is_compiling"):
+        try:
+            return bool(compiler.is_compiling())
+        except Exception:
+            pass
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is not None and hasattr(dynamo, "is_compiling"):
+        try:
+            return bool(dynamo.is_compiling())
+        except Exception:
+            pass
+    return False
+
 def _update_fast_runtime(args, base_model: nn.Module, step: int) -> None:
     FAST_RT.step = int(step)
     FAST_RT.total_layers = len(base_model.blocks)
@@ -675,6 +691,11 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) ->
 def attention_backend(q: Tensor, k: Tensor, v: Tensor, causal: bool = True, window_size: int | None = None) -> Tensor:
     if window_size is None:
         window_size = FAST_RT.attn_window
+    if window_size is not None and window_size < q.size(-2) and torch_is_compiling():
+        # Compiled masked SDPA falls back to a dense math path that materializes large
+        # T x T buffers on this stack. Keep the compiled training path on flash/global
+        # attention instead of OOMing during the local-window warmup phase.
+        window_size = None
     if _HAS_FLASH_ATTN_3 and (window_size is None or window_size >= q.size(1)):
         return flash_attn_3_func(q, k, v, causal=causal)
     q_t = q.transpose(1, 2)
