@@ -2079,8 +2079,6 @@ def main(argv: list[str] | None = None) -> None:
         f"eval_adapt:{args.eval_adapt} eval_score:{args.eval_score} "
         f"eval_use_compile:{args.eval_use_compile} validate_last_step:{args.validate_last_step}"
     )
-    if args.use_projection_qat:
-        log0(f"qat_start_ms:{args.qat_start_ms:.0f} effective_qat_start_ms:{effective_qat_start_ms:.0f}")
     if args.use_fast_adapters:
         if args.train_meta_start_tokens >= 0 or args.train_meta_end_tokens >= 0:
             meta_schedule_desc = (
@@ -2146,6 +2144,8 @@ def main(argv: list[str] | None = None) -> None:
         and effective_qat_start_ms >= effective_budget_ms
     ):
         effective_qat_start_ms = 0.85 * effective_budget_ms
+    if args.use_projection_qat:
+        log0(f"qat_start_ms:{args.qat_start_ms:.0f} effective_qat_start_ms:{effective_qat_start_ms:.0f}")
     wallclock_start = time.perf_counter()
 
     def wallclock_elapsed_ms() -> float:
