@@ -36,6 +36,11 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
+try:
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+except ImportError:
+    sdpa_kernel = None
+    SDPBackend = None
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # -----------------------------
@@ -814,6 +819,22 @@ BITLINEAR_CACHE_ENABLED = bool(int(os.environ.get("BITLINEAR_CACHE_ENABLED", "1"
 BITLINEAR_CACHE_VERSION = 1
 
 
+def torch_is_compiling() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and hasattr(compiler, "is_compiling"):
+        try:
+            return bool(compiler.is_compiling())
+        except Exception:
+            pass
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is not None and hasattr(dynamo, "is_compiling"):
+        try:
+            return bool(dynamo.is_compiling())
+        except Exception:
+            pass
+    return False
+
+
 def bump_bitlinear_cache_version() -> None:
     global BITLINEAR_CACHE_VERSION
     BITLINEAR_CACHE_VERSION += 1
@@ -1404,7 +1425,7 @@ class BitLinear(nn.Module):
         self._cached_ternary: Tensor | None = None
         self._cached_scale: Tensor | None = None
 
-    def _refresh_quant_cache(self) -> tuple[Tensor, Tensor]:
+    def _compute_quant_tensors(self) -> tuple[Tensor, Tensor]:
         weight_detached = self.weight_latent.detach()
         if BITLINEAR_GROUP_SIZE > 0:
             ternary_detached, scale = quantize_ternary_latent_tensor(weight_detached, BITLINEAR_GROUP_SIZE)
@@ -1413,12 +1434,21 @@ class BitLinear(nn.Module):
         else:
             cached_scale = weight_detached.abs().mean(dim=1, keepdim=True).clamp(min=1e-5).to(dtype=self.weight_latent.dtype)
             ternary = torch.round(weight_detached / cached_scale).clamp(-1, 1).to(dtype=self.weight_latent.dtype)
+        return ternary, cached_scale
+
+    def _refresh_quant_cache(self) -> tuple[Tensor, Tensor]:
+        ternary, cached_scale = self._compute_quant_tensors()
         self._cached_ternary = ternary
         self._cached_scale = cached_scale
         self._cache_version = BITLINEAR_CACHE_VERSION
         return ternary, cached_scale
 
     def _get_quant_cache(self) -> tuple[Tensor, Tensor]:
+        if torch_is_compiling():
+            # The global cache version is bumped after optimizer/project steps, which
+            # otherwise forces a recompile every iteration. Under torch.compile, compute
+            # the quantized view directly from the current latent weights instead.
+            return self._compute_quant_tensors()
         if not BITLINEAR_CACHE_ENABLED:
             return self._refresh_quant_cache()
         if (
@@ -1576,14 +1606,16 @@ class CausalSelfAttention(nn.Module):
             )
             is_causal = False
 
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
+        sdpa_kwargs = dict(
             attn_mask=attn_mask,
             is_causal=is_causal,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        if attn_mask is not None and sdpa_kernel is not None and SDPBackend is not None:
+            with sdpa_kernel([SDPBackend.MATH]):
+                y = F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -2383,6 +2415,9 @@ def main(argv: list[str] | None = None) -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        # Warmup is intended to prime compiled paths without consuming the measured
+        # wallclock budget for the real run.
+        wallclock_start = time.perf_counter()
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -2400,6 +2435,8 @@ def main(argv: list[str] | None = None) -> None:
     step = 0
     while True:
         elapsed_ms = wallclock_elapsed_ms()
+        if stop_after_step is None and effective_budget_ms is not None and elapsed_ms >= effective_budget_ms:
+            stop_after_step = step
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
         should_validate_by_step = (
