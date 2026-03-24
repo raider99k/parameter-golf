@@ -1369,6 +1369,10 @@ class Rotary(nn.Module):
         self._sin_cached: Tensor | None = None
 
     def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+        if torch_is_compiling():
+            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+            freqs = torch.outer(t, self.inv_freq.to(device))
+            return freqs.cos()[None, None, :, :].to(dtype=dtype), freqs.sin()[None, None, :, :].to(dtype=dtype)
         if (
             self._cos_cached is None
             or self._sin_cached is None
