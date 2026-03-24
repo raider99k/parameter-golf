@@ -125,6 +125,10 @@ def _fp8_linear(x: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
         or x.shape[-1] < FAST_RT.fp8_min_k
         or weight.shape[-1] < FAST_RT.fp8_min_k
         or not hasattr(torch, "_scaled_mm")
+        or torch.is_grad_enabled()
+        or x.requires_grad
+        or weight.requires_grad
+        or (bias is not None and bias.requires_grad)
     ):
         return F.linear(x, weight.to(x.dtype), bias.to(x.dtype) if bias is not None else None)
     x2 = x.reshape(-1, x.shape[-1]).contiguous()
