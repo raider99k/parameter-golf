@@ -1596,6 +1596,11 @@ class CausalSelfAttention(nn.Module):
         attn_mask = None
         is_causal = True
         window_size = SPEED_RT.attn_window if self.training else None
+        if window_size is not None and window_size < seqlen and torch_is_compiling():
+            # Compiled masked SDPA falls back to a dense math path that materializes large
+            # T x T buffers on this stack. Keep the compiled training path on full causal
+            # attention instead of OOMing during the local-window warmup phase.
+            window_size = None
         if window_size is not None and window_size < seqlen:
             pos = torch.arange(seqlen, device=x.device)
             allow = (pos[None, :] <= pos[:, None]) & (pos[None, :] >= (pos[:, None] - window_size + 1))
