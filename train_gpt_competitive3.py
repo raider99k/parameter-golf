@@ -1391,7 +1391,9 @@ class Rotary(nn.Module):
             inv_freq = self.inv_freq.to(device)
         t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
         freqs = torch.outer(t, inv_freq)
-        return freqs.cos()[None, None, :, :], freqs.sin()[None, None, :, :]
+        # q/k are shaped [B, T, H, D] before the SDPA transpose, so RoPE tables
+        # must broadcast as [1, T, 1, D/2].
+        return freqs.cos()[None, :, None, :], freqs.sin()[None, :, None, :]
 
     def forward(self, seq_len: int, device: torch.device, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
         if torch_is_compiling():
