@@ -141,9 +141,12 @@ class Hyperparameters:
     train_meta_loss_b_weight = float(os.environ.get("TRAIN_META_LOSS_B_WEIGHT", 0.95))
     train_meta_same_shard = bool(int(os.environ.get("TRAIN_META_SAME_SHARD", 1)))
 
-    # Validation scoring window. The current competitive line does not use eval-time TTT.
-    eval_adapt = int(os.environ.get("EVAL_ADAPT", 3072))
+    # Validation scoring window. The current competitive line does not use eval-time TTT,
+    # so the default should stay on plain fixed windows instead of long adaptive prefixes.
+    eval_adapt = int(os.environ.get("EVAL_ADAPT", 0))
     eval_score = int(os.environ.get("EVAL_SCORE", 1024))
+    eval_use_compile = bool(int(os.environ.get("EVAL_USE_COMPILE", "0")))
+    validate_last_step = bool(int(os.environ.get("VALIDATE_LAST_STEP", "0")))
 
     # Compile behavior
     use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
@@ -248,8 +251,10 @@ class Hyperparameters:
         self.train_meta_loss_a_weight = float(os.environ.get("TRAIN_META_LOSS_A_WEIGHT", 0.05))
         self.train_meta_loss_b_weight = float(os.environ.get("TRAIN_META_LOSS_B_WEIGHT", 0.95))
         self.train_meta_same_shard = bool(int(os.environ.get("TRAIN_META_SAME_SHARD", 1)))
-        self.eval_adapt = int(os.environ.get("EVAL_ADAPT", 3072))
+        self.eval_adapt = int(os.environ.get("EVAL_ADAPT", 0))
         self.eval_score = int(os.environ.get("EVAL_SCORE", 1024))
+        self.eval_use_compile = bool(int(os.environ.get("EVAL_USE_COMPILE", "0")))
+        self.validate_last_step = bool(int(os.environ.get("VALIDATE_LAST_STEP", "0")))
 
         # Compile behavior
         self.use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
@@ -279,6 +284,7 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "EMBED_LR",
     "EVAL_ADAPT",
     "EVAL_SCORE",
+    "EVAL_USE_COMPILE",
     "FAST_GRAD_CLIP",
     "FAST_GATE_INIT",
     "FAST_RANK",
@@ -346,6 +352,7 @@ CLI_OVERRIDE_ENV_KEYS = frozenset({
     "USE_FACTOR_EMBED",
     "USE_FAST_ADAPTERS",
     "USE_PROJECTION_QAT",
+    "VALIDATE_LAST_STEP",
     "VALIDATE_AT_STEP_ZERO",
     "VAL_LOSS_EVERY",
     "VAL_LOSS_EVERY_SECONDS",
@@ -1988,6 +1995,7 @@ def main(argv: list[str] | None = None) -> None:
         compiled_model = base_model
 
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    eval_model: nn.Module = compiled_model if args.eval_use_compile else base_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -2066,6 +2074,10 @@ def main(argv: list[str] | None = None) -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f} "
         f"finalize_reserve_seconds:{args.finalize_reserve_seconds:.3f}"
+    )
+    log0(
+        f"eval_adapt:{args.eval_adapt} eval_score:{args.eval_score} "
+        f"eval_use_compile:{args.eval_use_compile} validate_last_step:{args.validate_last_step}"
     )
     if args.use_fast_adapters:
         if args.train_meta_start_tokens >= 0 or args.train_meta_end_tokens >= 0:
@@ -2200,6 +2212,7 @@ def main(argv: list[str] | None = None) -> None:
     stop_after_step: int | None = None
     val_interval_ms = args.val_loss_every_seconds * 1000.0 if args.val_loss_every_seconds > 0 else None
     next_val_ms = val_interval_ms
+    should_validate_last_step = args.validate_last_step or args.restore_best_val_checkpoint
     best_val_loss: float | None = None
     best_val_bpb: float | None = None
     best_val_step: int | None = None
@@ -2223,11 +2236,11 @@ def main(argv: list[str] | None = None) -> None:
             and (args.validate_at_step_zero or step > 0)
             and elapsed_ms >= next_val_ms
         )
-        should_validate = last_step or should_validate_by_step or should_validate_by_time
+        should_validate = (last_step and should_validate_last_step) or should_validate_by_step or should_validate_by_time
         if should_validate:
             val_loss, val_bpb = eval_val(
                 args,
-                model,
+                eval_model,
                 rank,
                 world_size,
                 device,
@@ -2456,7 +2469,7 @@ def main(argv: list[str] | None = None) -> None:
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
-        model,
+        eval_model,
         rank,
         world_size,
         device,
