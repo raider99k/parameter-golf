@@ -142,8 +142,8 @@ class Hyperparameters:
     train_meta_same_shard = bool(int(os.environ.get("TRAIN_META_SAME_SHARD", 1)))
 
     # Validation scoring window. The current competitive line does not use eval-time TTT,
-    # so the default should stay on plain fixed windows instead of long adaptive prefixes.
-    eval_adapt = int(os.environ.get("EVAL_ADAPT", 0))
+    # but scoring should still preserve causal prefix context across score blocks.
+    eval_adapt = int(os.environ.get("EVAL_ADAPT", 3072))
     eval_score = int(os.environ.get("EVAL_SCORE", 1024))
     eval_use_compile = bool(int(os.environ.get("EVAL_USE_COMPILE", "0")))
     validate_last_step = bool(int(os.environ.get("VALIDATE_LAST_STEP", "0")))
@@ -251,7 +251,7 @@ class Hyperparameters:
         self.train_meta_loss_a_weight = float(os.environ.get("TRAIN_META_LOSS_A_WEIGHT", 0.05))
         self.train_meta_loss_b_weight = float(os.environ.get("TRAIN_META_LOSS_B_WEIGHT", 0.95))
         self.train_meta_same_shard = bool(int(os.environ.get("TRAIN_META_SAME_SHARD", 1)))
-        self.eval_adapt = int(os.environ.get("EVAL_ADAPT", 0))
+        self.eval_adapt = int(os.environ.get("EVAL_ADAPT", 3072))
         self.eval_score = int(os.environ.get("EVAL_SCORE", 1024))
         self.eval_use_compile = bool(int(os.environ.get("EVAL_USE_COMPILE", "0")))
         self.validate_last_step = bool(int(os.environ.get("VALIDATE_LAST_STEP", "0")))
@@ -2079,6 +2079,8 @@ def main(argv: list[str] | None = None) -> None:
         f"eval_adapt:{args.eval_adapt} eval_score:{args.eval_score} "
         f"eval_use_compile:{args.eval_use_compile} validate_last_step:{args.validate_last_step}"
     )
+    if args.use_projection_qat:
+        log0(f"qat_start_ms:{args.qat_start_ms:.0f} effective_qat_start_ms:{effective_qat_start_ms:.0f}")
     if args.use_fast_adapters:
         if args.train_meta_start_tokens >= 0 or args.train_meta_end_tokens >= 0:
             meta_schedule_desc = (
@@ -2136,6 +2138,14 @@ def main(argv: list[str] | None = None) -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
     finalize_reserve_ms = 1000.0 * max(args.finalize_reserve_seconds, 0.0)
     effective_budget_ms = None if max_wallclock_ms is None else max(max_wallclock_ms - finalize_reserve_ms, 1.0)
+    effective_qat_start_ms = args.qat_start_ms
+    if (
+        args.use_projection_qat
+        and effective_budget_ms is not None
+        and effective_budget_ms > 0.0
+        and effective_qat_start_ms >= effective_budget_ms
+    ):
+        effective_qat_start_ms = 0.85 * effective_budget_ms
     wallclock_start = time.perf_counter()
 
     def wallclock_elapsed_ms() -> float:
@@ -2218,6 +2228,7 @@ def main(argv: list[str] | None = None) -> None:
     best_val_step: int | None = None
     best_val_train_time_ms: float | None = None
     best_state_dict: dict[str, torch.Tensor] | None = None
+    qat_enabled_logged = False
 
     step = 0
     while True:
@@ -2289,7 +2300,7 @@ def main(argv: list[str] | None = None) -> None:
             and args.train_meta_steps > 0
             and (step % args.train_meta_every == 0)
         )
-        qat_active = args.use_projection_qat and (elapsed_ms >= args.qat_start_ms)
+        qat_active = args.use_projection_qat and (elapsed_ms >= effective_qat_start_ms)
         compression_reg_active = (
             args.compression_reg_weight > 0.0
             and progress >= args.compression_reg_start_frac
@@ -2297,6 +2308,12 @@ def main(argv: list[str] | None = None) -> None:
         )
         scale = lr_mul(step, elapsed_ms)
         if qat_active:
+            if not qat_enabled_logged:
+                qat_enabled_logged = True
+                log0(
+                    f"late_qat:enabled step:{step} "
+                    f"effective_start_ms:{effective_qat_start_ms:.0f} configured_start_ms:{args.qat_start_ms:.0f}"
+                )
             scale *= args.qat_lr_scale
 
         zero_grad_all()
