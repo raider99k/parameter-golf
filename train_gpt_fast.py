@@ -128,7 +128,7 @@ def _fp8_linear(x: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
         scale_b = torch.tensor(1.0, device=x.device, dtype=torch.float32)
         out = torch._scaled_mm(
             x2.to(torch.float8_e4m3fn),
-            weight.t().contiguous().to(torch.float8_e4m3fn),
+            weight.to(torch.float8_e4m3fn).t(),
             scale_a=scale_a,
             scale_b=scale_b,
             out_dtype=x.dtype,

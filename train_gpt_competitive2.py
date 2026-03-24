@@ -666,6 +666,22 @@ BITLINEAR_CACHE_ENABLED = bool(int(os.environ.get("BITLINEAR_CACHE_ENABLED", "1"
 BITLINEAR_CACHE_VERSION = 1
 
 
+def torch_is_compiling() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    if compiler is not None and hasattr(compiler, "is_compiling"):
+        try:
+            return bool(compiler.is_compiling())
+        except Exception:
+            pass
+    dynamo = getattr(torch, "_dynamo", None)
+    if dynamo is not None and hasattr(dynamo, "is_compiling"):
+        try:
+            return bool(dynamo.is_compiling())
+        except Exception:
+            pass
+    return False
+
+
 def bump_bitlinear_cache_version() -> None:
     global BITLINEAR_CACHE_VERSION
     BITLINEAR_CACHE_VERSION += 1
@@ -1256,7 +1272,7 @@ class BitLinear(nn.Module):
         self._cached_ternary: Tensor | None = None
         self._cached_scale: Tensor | None = None
 
-    def _refresh_quant_cache(self) -> tuple[Tensor, Tensor]:
+    def _compute_quant_tensors(self) -> tuple[Tensor, Tensor]:
         weight_detached = self.weight_latent.detach()
         if BITLINEAR_GROUP_SIZE > 0:
             ternary_detached, scale = quantize_ternary_latent_tensor(weight_detached, BITLINEAR_GROUP_SIZE)
@@ -1265,12 +1281,21 @@ class BitLinear(nn.Module):
         else:
             cached_scale = weight_detached.abs().mean(dim=1, keepdim=True).clamp(min=1e-5).to(dtype=self.weight_latent.dtype)
             ternary = torch.round(weight_detached / cached_scale).clamp(-1, 1).to(dtype=self.weight_latent.dtype)
+        return ternary, cached_scale
+
+    def _refresh_quant_cache(self) -> tuple[Tensor, Tensor]:
+        ternary, cached_scale = self._compute_quant_tensors()
         self._cached_ternary = ternary
         self._cached_scale = cached_scale
         self._cache_version = BITLINEAR_CACHE_VERSION
         return ternary, cached_scale
 
     def _get_quant_cache(self) -> tuple[Tensor, Tensor]:
+        if torch_is_compiling():
+            # The global cache version is bumped after optimizer/project steps, which
+            # otherwise forces a recompile every iteration. Under torch.compile, compute
+            # the quantized view directly from the current latent weights instead.
+            return self._compute_quant_tensors()
         if not BITLINEAR_CACHE_ENABLED:
             return self._refresh_quant_cache()
         if (
