@@ -1035,6 +1035,7 @@ class GPT(nn.Module):
                 use_full_core = (
                     self.cheap_core is None
                     or step_idx % self.core_refresh_every == 0
+                    or use_xsa
                 )
                 if use_full_core:
                     x = block(x, x0, v_embed=v_extra, step_mod=step_mod, use_xsa=use_xsa)
