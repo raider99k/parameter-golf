@@ -105,6 +105,8 @@ class Hyperparameters:
     shared_depth = int(os.environ.get("SHARED_DEPTH", max(1, int(os.environ.get("NUM_LAYERS", "11")) - int(os.environ.get("INTERFACE_LAYERS", "2")) - int(os.environ.get("TAIL_LAYERS", "1")))))
     level_dim = int(os.environ.get("LEVEL_DIM", 24))
     level_scale = float(os.environ.get("LEVEL_SCALE", 0.08))
+    core_refresh_every = int(os.environ.get("CORE_REFRESH_EVERY", 0))
+    cheap_core_bottleneck = int(os.environ.get("CHEAP_CORE_BOTTLENECK", 256))
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -660,6 +662,62 @@ class SharedStepModulator(nn.Module):
             "mix": mix.to(dtype=dtype),
         }
 
+class CheapCoreBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        bottleneck_dim: int,
+        layer_idx: int = 0,
+        ln_scale: bool = False,
+        dtg: bool = False,
+        kernel_size: int = 3,
+    ):
+        super().__init__()
+        bottleneck_dim = max(1, bottleneck_dim)
+        kernel_size = max(1, kernel_size | 1)
+        self.norm = RMSNorm()
+        self.dwconv = nn.Conv1d(dim, dim, kernel_size, padding=kernel_size // 2, groups=dim, bias=False)
+        nn.init.dirac_(self.dwconv.weight)
+        self.in_proj = CastedLinear(dim, 2 * bottleneck_dim, bias=False)
+        self.out_proj = CastedLinear(bottleneck_dim, dim, bias=False)
+        self.out_proj._zero_init = True
+        self.scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
+        if dtg:
+            self.dtg_gate = nn.Linear(dim, 1, bias=True)
+            nn.init.zeros_(self.dtg_gate.weight)
+            nn.init.constant_(self.dtg_gate.bias, 2.0)
+        else:
+            self.dtg_gate = None
+    def forward(
+        self,
+        x: Tensor,
+        x0: Tensor,
+        v_embed: Tensor | None = None,
+        step_mod: dict[str, Tensor] | None = None,
+    ) -> Tensor:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        if step_mod is not None:
+            mix = mix + step_mod["mix"]
+        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        if v_embed is not None:
+            x_in = x_in + v_embed
+        h = self.norm(x_in) * self.ln_scale_factor
+        local = self.dwconv(h.transpose(1, 2)).transpose(1, 2)
+        if step_mod is not None:
+            local = local * (1.0 + step_mod["attn"])[None, None, :]
+            scale = self.scale.to(dtype=x.dtype) * (1.0 + step_mod["mlp"])
+        else:
+            scale = self.scale.to(dtype=x.dtype)
+        h = h + local
+        u, g = self.in_proj(h).chunk(2, dim=-1)
+        x_out = x_in + scale[None, None, :] * self.out_proj(u * torch.sigmoid(g))
+        if self.dtg_gate is not None:
+            gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
+            x_out = x_in + gate * (x_out - x_in)
+        return x_out
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -745,6 +803,8 @@ class GPT(nn.Module):
         shared_depth: int = 8,
         level_dim: int = 24,
         level_scale: float = 0.08,
+        core_refresh_every: int = 0,
+        cheap_core_bottleneck: int = 256,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)
@@ -759,6 +819,8 @@ class GPT(nn.Module):
         self.tail_layers = max(0, tail_layers)
         self.shared_depth = max(1, shared_depth)
         self.num_shared_cores = max(1, num_shared_cores)
+        self.core_refresh_every = max(0, core_refresh_every)
+        self.cheap_core_bottleneck = max(1, cheap_core_bottleneck)
         self.virtual_num_layers = self.interface_layers + self.shared_depth + self.tail_layers
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
@@ -777,6 +839,17 @@ class GPT(nn.Module):
         ])
         self.core_schedule = [i % self.num_shared_cores for i in range(self.shared_depth)]
         self.level_mod = SharedStepModulator(self.shared_depth, level_dim, model_dim, level_scale)
+        self.cheap_core = (
+            CheapCoreBlock(
+                model_dim,
+                self.cheap_core_bottleneck,
+                layer_idx=self.interface_layers,
+                ln_scale=ln_scale,
+                dtg=dtg,
+            )
+            if self.core_refresh_every > 1 and self.shared_depth > 1
+            else None
+        )
         self.blocks = nn.ModuleList(list(self.interface_blocks) + list(self.core_bank) + list(self.tail_blocks))
         if rope_dims > 0:
             head_dim = model_dim // num_heads
@@ -850,10 +923,14 @@ class GPT(nn.Module):
             virt += 1
         return layers
     def arch_summary(self) -> str:
+        core_mode = "hybrid" if self.cheap_core is not None else "full"
+        extra = ""
+        if self.cheap_core is not None:
+            extra = f" core_refresh_every:{self.core_refresh_every} cheap_core_bottleneck:{self.cheap_core_bottleneck}"
         return (
             f"holy_recurrent interface:{self.interface_layers} shared_depth:{self.shared_depth} "
             f"shared_cores:{self.num_shared_cores} tail:{self.tail_layers} "
-            f"virtual_layers:{self.virtual_num_layers}"
+            f"virtual_layers:{self.virtual_num_layers} core_mode:{core_mode}{extra}"
         )
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -917,7 +994,15 @@ class GPT(nn.Module):
             block = self.core_bank[bank_idx]
             step_mod = self.level_mod(step_idx, dtype=x.dtype)
             v_extra = self._compose_v_extra(virt, input_ids, ve_cache, value_residual_cache)
-            x = block(x, x0, v_embed=v_extra, step_mod=step_mod)
+            use_full_core = (
+                self.cheap_core is None
+                or step_idx % self.core_refresh_every == 0
+                or block.attn.use_xsa
+            )
+            if use_full_core:
+                x = block(x, x0, v_embed=v_extra, step_mod=step_mod)
+            else:
+                x = self.cheap_core(x, x0, v_embed=v_extra, step_mod=step_mod)
             virt += 1
         for block in self.tail_blocks:
             v_extra = self._compose_v_extra(virt, input_ids, ve_cache, value_residual_cache)
@@ -1305,6 +1390,8 @@ def main() -> None:
         shared_depth=args.shared_depth,
         level_dim=args.level_dim,
         level_scale=args.level_scale,
+        core_refresh_every=args.core_refresh_every,
+        cheap_core_bottleneck=args.cheap_core_bottleneck,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1389,6 +1476,11 @@ def main() -> None:
     )
     if args.lawa_enabled:
         log0(f"lawa:enabled k:{args.lawa_k} freq:{args.lawa_freq}")
+    if args.core_refresh_every > 0:
+        log0(
+            f"core_refresh_every:{args.core_refresh_every} "
+            f"cheap_core_bottleneck:{args.cheap_core_bottleneck}"
+        )
     if args.export_sensitive_fp16_topk > 0:
         log0(
             f"export_sensitive_fp16_topk:{args.export_sensitive_fp16_topk} "
@@ -1585,6 +1677,8 @@ def main() -> None:
         interface_layers=args.interface_layers, tail_layers=args.tail_layers,
         num_shared_cores=args.num_shared_cores, shared_depth=args.shared_depth,
         level_dim=args.level_dim, level_scale=args.level_scale,
+        core_refresh_every=args.core_refresh_every,
+        cheap_core_bottleneck=args.cheap_core_bottleneck,
     ).to(device).bfloat16()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
