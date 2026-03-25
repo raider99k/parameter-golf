@@ -617,7 +617,7 @@ class BigramHashEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 class ValueEmbedding(nn.Module):
     """Reinject token identity into attention values at specific layers.
-    Each table maps vocab tokens to a low-dim embedding, projected to model_dim."""
+    Each table maps vocab tokens to a low-dim embedding, projected to KV dim."""
     def __init__(self, vocab_size: int, ve_dim: int, model_dim: int):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, ve_dim)
@@ -1027,11 +1027,11 @@ class GPT(nn.Module):
         for step_idx, bank_idx in enumerate(self.core_schedule):
             block = self.core_bank[bank_idx]
             step_mod = self.level_mod(step_idx, dtype=x.dtype)
-            v_extra = self._compose_v_extra(virt, input_ids, ve_cache, value_residual_cache)
             use_xsa = (virt in self.xsa_virtual_layer_indices)
             if self.latent_bridge is not None:
                 latent_x = block(latent_x, latent_x0, v_embed=None, step_mod=step_mod, use_xsa=use_xsa)
             else:
+                v_extra = self._compose_v_extra(virt, input_ids, ve_cache, value_residual_cache)
                 use_full_core = (
                     self.cheap_core is None
                     or step_idx % self.core_refresh_every == 0
@@ -1585,8 +1585,8 @@ def main() -> None:
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
-    ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
     ema_decay = args.ema_decay
+    ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()} if ema_decay > 0.0 else {}
     lawa_queue: deque[dict[str, Tensor]] = deque(maxlen=max(1, args.lawa_k)) if args.lawa_enabled else deque()
     training_time_ms = 0.0
     stop_after_step: int | None = None
