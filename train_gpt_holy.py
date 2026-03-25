@@ -81,6 +81,8 @@ class Hyperparameters:
     lawa_enabled = bool(int(os.environ.get("LAWA_ENABLED", "0")))
     lawa_k = int(os.environ.get("LAWA_K", 10))
     lawa_freq = int(os.environ.get("LAWA_FREQ", 100))
+    export_sensitive_fp16_topk = int(os.environ.get("EXPORT_SENSITIVE_FP16_TOPK", 4))
+    export_sensitive_fp16_min_score = float(os.environ.get("EXPORT_SENSITIVE_FP16_MIN_SCORE", 0.0))
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
@@ -1056,6 +1058,40 @@ def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
     scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)
     q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
     return q, scale
+def int6_tensor_quantization_score(t: Tensor) -> float:
+    if t.ndim != 2 or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+        return 0.0
+    t32 = t.float()
+    q, s = quantize_int6_per_row(t32)
+    recon = q.float() * s.float()[:, None]
+    mse = (t32 - recon).pow(2).mean().item()
+    energy = t32.pow(2).mean().item()
+    return mse if energy <= 0.0 else mse / energy
+def select_sensitive_fp16_names(
+    state_dict: dict[str, Tensor],
+    int6_cats: set[str],
+    passthrough_fp16_names: set[str] | None = None,
+    topk: int = 0,
+    min_score: float = 0.0,
+) -> set[str]:
+    if topk <= 0:
+        return set()
+    passthrough_fp16_names = passthrough_fp16_names or set()
+    scored: list[tuple[float, str]] = []
+    for name, tensor in state_dict.items():
+        if name in passthrough_fp16_names:
+            continue
+        if not tensor.is_floating_point() or tensor.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            continue
+        if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+            continue
+        if _classify_param(name) not in int6_cats:
+            continue
+        score = int6_tensor_quantization_score(tensor)
+        if score >= min_score:
+            scored.append((score, name))
+    scored.sort(reverse=True)
+    return {name for _, name in scored[:topk]}
 def mixed_quantize_int6(
     state_dict: dict[str, Tensor],
     int6_cats: set[str],
@@ -1309,6 +1345,11 @@ def main() -> None:
     )
     if args.lawa_enabled:
         log0(f"lawa:enabled k:{args.lawa_k} freq:{args.lawa_freq}")
+    if args.export_sensitive_fp16_topk > 0:
+        log0(
+            f"export_sensitive_fp16_topk:{args.export_sensitive_fp16_topk} "
+            f"min_score:{args.export_sensitive_fp16_min_score}"
+        )
     log0(f"seed:{args.seed}")
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     def zero_grad_all() -> None:
@@ -1480,19 +1521,60 @@ def main() -> None:
                 lawa_state[name].add_(t.float())
         inv_k = 1.0 / float(len(lawa_queue))
         final_candidates.append(("lawa", {name: (t * inv_k) for name, t in lawa_state.items()}))
+    export_fp16_base_names = {
+        "tok_emb.weight",
+        "bigram.embed.weight",
+        "ve_shared.embed.weight",
+    }
+    eval_model = GPT(
+        vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
+        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+        tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
+        logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+        mtp_num_heads=0, mtp_loss_weight=0.0,
+        bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+        xsa_last_n=args.xsa_last_n,  # must match training model
+        rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
+        ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
+        value_residual=args.value_residual, value_residual_init=args.value_residual_init,
+        interface_layers=args.interface_layers, tail_layers=args.tail_layers,
+        num_shared_cores=args.num_shared_cores, shared_depth=args.shared_depth,
+        level_dim=args.level_dim, level_scale=args.level_scale,
+    ).to(device).bfloat16()
+    for m in eval_model.modules():
+        if isinstance(m, CastedLinear):
+            m.float()
+    restore_low_dim_params_to_fp32(eval_model)
+    eval_model.eval()
+    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
     best_label = "raw"
     best_state = raw_state
     best_val_loss = float("inf")
     best_val_bpb = float("inf")
+    best_export_fp16_names = set(export_fp16_base_names)
     if len(final_candidates) == 1:
         log0("final_selection:raw_only")
     for label, candidate_state in final_candidates:
-        base_model.load_state_dict(candidate_state, strict=True)
+        candidate_sensitive_fp16_names = select_sensitive_fp16_names(
+            candidate_state,
+            {"mlp", "attn"},
+            export_fp16_base_names,
+            args.export_sensitive_fp16_topk,
+            args.export_sensitive_fp16_min_score,
+        )
+        candidate_export_fp16_names = export_fp16_base_names | candidate_sensitive_fp16_names
+        quant_result, quant_meta = mixed_quantize_int6(
+            candidate_state,
+            {"mlp", "attn"},
+            candidate_export_fp16_names,
+        )
+        candidate_deq_state = dequantize_mixed_int6(quant_result, quant_meta, candidate_state)
+        eval_model.load_state_dict(candidate_deq_state, strict=True)
         torch.cuda.synchronize()
         t_candidate = time.perf_counter()
         cand_val_loss, cand_val_bpb = eval_val(
             args,
-            compiled_model,
+            compiled_eval,
             rank,
             world_size,
             device,
@@ -1504,7 +1586,8 @@ def main() -> None:
         )
         torch.cuda.synchronize()
         log0(
-            f"final_candidate:{label} val_loss:{cand_val_loss:.4f} val_bpb:{cand_val_bpb:.4f} "
+            f"final_candidate:{label} quantized_val_loss:{cand_val_loss:.4f} quantized_val_bpb:{cand_val_bpb:.4f} "
+            f"fp16_tensors:{len(candidate_sensitive_fp16_names)} "
             f"eval_time:{1000.0 * (time.perf_counter() - t_candidate):.0f}ms"
         )
         if cand_val_loss < best_val_loss:
@@ -1512,17 +1595,19 @@ def main() -> None:
             best_state = candidate_state
             best_val_loss = cand_val_loss
             best_val_bpb = cand_val_bpb
-    log0(f"final_selection:{best_label} val_loss:{best_val_loss:.4f} val_bpb:{best_val_bpb:.4f}")
+            best_export_fp16_names = candidate_export_fp16_names
+    log0(f"final_selection:{best_label} quantized_val_loss:{best_val_loss:.4f} quantized_val_bpb:{best_val_bpb:.4f}")
     base_model.load_state_dict(best_state, strict=True)
+    eval_model.load_state_dict(best_state, strict=True)
     torch.cuda.synchronize()
     t_diag = time.perf_counter()
     diag_val_loss, diag_val_bpb = eval_val(
-        args, compiled_model, rank, world_size, device, grad_accum_steps,
+        args, compiled_eval, rank, world_size, device, grad_accum_steps,
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
     log0(
-        f"DIAGNOSTIC post_select val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
+        f"DIAGNOSTIC post_select_raw val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
     )
     full_state_dict = base_model.state_dict()
@@ -1540,11 +1625,7 @@ def main() -> None:
     quant_result, quant_meta = mixed_quantize_int6(
         sd_cpu,
         {"mlp", "attn"},
-        {
-            "tok_emb.weight",
-            "bigram.embed.weight",
-            "ve_shared.embed.weight",
-        },
+        best_export_fp16_names,
     )
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
@@ -1566,27 +1647,7 @@ def main() -> None:
         map_location="cpu",
     )
     deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
-    eval_model = GPT(
-        vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
-        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-        mtp_num_heads=0, mtp_loss_weight=0.0,
-        bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-        xsa_last_n=args.xsa_last_n,  # must match training model
-        rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
-        ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
-        value_residual=args.value_residual, value_residual_init=args.value_residual_init,
-        interface_layers=args.interface_layers, tail_layers=args.tail_layers,
-        num_shared_cores=args.num_shared_cores, shared_depth=args.shared_depth,
-        level_dim=args.level_dim, level_scale=args.level_scale,
-    ).to(device).bfloat16()
-    for m in eval_model.modules():
-        if isinstance(m, CastedLinear):
-            m.float()
-    restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
