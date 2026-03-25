@@ -105,6 +105,9 @@ class Hyperparameters:
     shared_depth = int(os.environ.get("SHARED_DEPTH", max(1, int(os.environ.get("NUM_LAYERS", "11")) - int(os.environ.get("INTERFACE_LAYERS", "2")) - int(os.environ.get("TAIL_LAYERS", "1")))))
     level_dim = int(os.environ.get("LEVEL_DIM", 24))
     level_scale = float(os.environ.get("LEVEL_SCALE", 0.08))
+    latent_core_enabled = bool(int(os.environ.get("LATENT_CORE_ENABLED", "0")))
+    latent_core_stride = int(os.environ.get("LATENT_CORE_STRIDE", 4))
+    latent_core_kernel = int(os.environ.get("LATENT_CORE_KERNEL", 5))
     core_refresh_every = int(os.environ.get("CORE_REFRESH_EVERY", 0))
     cheap_core_bottleneck = int(os.environ.get("CHEAP_CORE_BOTTLENECK", 256))
 
@@ -662,6 +665,31 @@ class SharedStepModulator(nn.Module):
             "mix": mix.to(dtype=dtype),
         }
 
+class LatentBottleneck(nn.Module):
+    def __init__(self, dim: int, stride: int, kernel_size: int = 5):
+        super().__init__()
+        self.stride = max(1, stride)
+        self.kernel_size = max(1, kernel_size | 1)
+        self.norm = RMSNorm()
+        self.down_proj = CastedLinear(dim, dim, bias=False)
+        self.down_conv = nn.Conv1d(dim, dim, self.kernel_size, stride=self.stride, groups=dim, bias=False)
+        self.up_proj = CastedLinear(dim, dim, bias=False)
+        nn.init.orthogonal_(self.down_proj.weight, gain=1.0)
+        nn.init.orthogonal_(self.up_proj.weight, gain=0.05)
+        with torch.no_grad():
+            self.down_conv.weight.zero_()
+            self.down_conv.weight[:, 0, -1] = 1.0
+    def compress(self, x: Tensor) -> Tensor:
+        h = self.norm(x)
+        h = self.down_proj(h)
+        h = F.pad(h.transpose(1, 2), (self.kernel_size - 1, 0))
+        return self.down_conv(h).transpose(1, 2)
+    def decompress(self, z: Tensor, target_len: int) -> Tensor:
+        if target_len <= 0:
+            return z.new_zeros(z.size(0), 0, z.size(-1))
+        x = z.repeat_interleave(self.stride, dim=1)[:, :target_len, :]
+        return self.up_proj(x)
+
 class CheapCoreBlock(nn.Module):
     def __init__(
         self,
@@ -803,6 +831,9 @@ class GPT(nn.Module):
         shared_depth: int = 8,
         level_dim: int = 24,
         level_scale: float = 0.08,
+        latent_core_enabled: bool = False,
+        latent_core_stride: int = 4,
+        latent_core_kernel: int = 5,
         core_refresh_every: int = 0,
         cheap_core_bottleneck: int = 256,
     ):
@@ -819,6 +850,9 @@ class GPT(nn.Module):
         self.tail_layers = max(0, tail_layers)
         self.shared_depth = max(1, shared_depth)
         self.num_shared_cores = max(1, num_shared_cores)
+        self.latent_core_enabled = latent_core_enabled
+        self.latent_core_stride = max(1, latent_core_stride)
+        self.latent_core_kernel = max(1, latent_core_kernel | 1)
         self.core_refresh_every = max(0, core_refresh_every)
         self.cheap_core_bottleneck = max(1, cheap_core_bottleneck)
         self.virtual_num_layers = self.interface_layers + self.shared_depth + self.tail_layers
@@ -839,6 +873,15 @@ class GPT(nn.Module):
         ])
         self.core_schedule = [i % self.num_shared_cores for i in range(self.shared_depth)]
         self.level_mod = SharedStepModulator(self.shared_depth, level_dim, model_dim, level_scale)
+        self.latent_bridge = (
+            LatentBottleneck(
+                model_dim,
+                self.latent_core_stride,
+                kernel_size=self.latent_core_kernel,
+            )
+            if self.latent_core_enabled
+            else None
+        )
         self.cheap_core = (
             CheapCoreBlock(
                 model_dim,
@@ -847,7 +890,7 @@ class GPT(nn.Module):
                 ln_scale=ln_scale,
                 dtg=dtg,
             )
-            if self.core_refresh_every > 1 and self.shared_depth > 1
+            if self.latent_bridge is None and self.core_refresh_every > 1 and self.shared_depth > 1
             else None
         )
         self.blocks = nn.ModuleList(list(self.interface_blocks) + list(self.core_bank) + list(self.tail_blocks))
@@ -923,9 +966,11 @@ class GPT(nn.Module):
             virt += 1
         return layers
     def arch_summary(self) -> str:
-        core_mode = "hybrid" if self.cheap_core is not None else "full"
+        core_mode = "latent" if self.latent_bridge is not None else ("hybrid" if self.cheap_core is not None else "full")
         extra = ""
-        if self.cheap_core is not None:
+        if self.latent_bridge is not None:
+            extra = f" latent_stride:{self.latent_core_stride} latent_kernel:{self.latent_core_kernel}"
+        elif self.cheap_core is not None:
             extra = f" core_refresh_every:{self.core_refresh_every} cheap_core_bottleneck:{self.cheap_core_bottleneck}"
         return (
             f"holy_recurrent interface:{self.interface_layers} shared_depth:{self.shared_depth} "
@@ -990,20 +1035,31 @@ class GPT(nn.Module):
             v_extra = self._compose_v_extra(virt, input_ids, ve_cache, value_residual_cache)
             x = block(x, x0, v_embed=v_extra)
             virt += 1
+        latent_x = None
+        latent_x0 = None
+        if self.latent_bridge is not None:
+            latent_x = self.latent_bridge.compress(x)
+            latent_x0 = self.latent_bridge.compress(x0)
         for step_idx, bank_idx in enumerate(self.core_schedule):
             block = self.core_bank[bank_idx]
             step_mod = self.level_mod(step_idx, dtype=x.dtype)
             v_extra = self._compose_v_extra(virt, input_ids, ve_cache, value_residual_cache)
-            use_full_core = (
-                self.cheap_core is None
-                or step_idx % self.core_refresh_every == 0
-                or block.attn.use_xsa
-            )
-            if use_full_core:
-                x = block(x, x0, v_embed=v_extra, step_mod=step_mod)
+            if self.latent_bridge is not None:
+                latent_v_extra = self.latent_bridge.compress(v_extra) if v_extra is not None else None
+                latent_x = block(latent_x, latent_x0, v_embed=latent_v_extra, step_mod=step_mod)
             else:
-                x = self.cheap_core(x, x0, v_embed=v_extra, step_mod=step_mod)
+                use_full_core = (
+                    self.cheap_core is None
+                    or step_idx % self.core_refresh_every == 0
+                    or block.attn.use_xsa
+                )
+                if use_full_core:
+                    x = block(x, x0, v_embed=v_extra, step_mod=step_mod)
+                else:
+                    x = self.cheap_core(x, x0, v_embed=v_extra, step_mod=step_mod)
             virt += 1
+        if self.latent_bridge is not None and latent_x is not None:
+            x = x + self.latent_bridge.decompress(latent_x, x.size(1))
         for block in self.tail_blocks:
             v_extra = self._compose_v_extra(virt, input_ids, ve_cache, value_residual_cache)
             x = block(x, x0, v_embed=v_extra)
@@ -1390,6 +1446,9 @@ def main() -> None:
         shared_depth=args.shared_depth,
         level_dim=args.level_dim,
         level_scale=args.level_scale,
+        latent_core_enabled=args.latent_core_enabled,
+        latent_core_stride=args.latent_core_stride,
+        latent_core_kernel=args.latent_core_kernel,
         core_refresh_every=args.core_refresh_every,
         cheap_core_bottleneck=args.cheap_core_bottleneck,
     ).to(device).bfloat16()
@@ -1476,6 +1535,11 @@ def main() -> None:
     )
     if args.lawa_enabled:
         log0(f"lawa:enabled k:{args.lawa_k} freq:{args.lawa_freq}")
+    if args.latent_core_enabled:
+        log0(
+            f"latent_core:enabled stride:{args.latent_core_stride} "
+            f"kernel:{args.latent_core_kernel}"
+        )
     if args.core_refresh_every > 0:
         log0(
             f"core_refresh_every:{args.core_refresh_every} "
@@ -1677,6 +1741,9 @@ def main() -> None:
         interface_layers=args.interface_layers, tail_layers=args.tail_layers,
         num_shared_cores=args.num_shared_cores, shared_depth=args.shared_depth,
         level_dim=args.level_dim, level_scale=args.level_scale,
+        latent_core_enabled=args.latent_core_enabled,
+        latent_core_stride=args.latent_core_stride,
+        latent_core_kernel=args.latent_core_kernel,
         core_refresh_every=args.core_refresh_every,
         cheap_core_bottleneck=args.cheap_core_bottleneck,
     ).to(device).bfloat16()
