@@ -912,6 +912,7 @@ class GPT(nn.Module):
             use_xsa = virt_c in self.xsa_virtual_layer_indices
             use_full = (
                 self.latent_bridge is not None
+                or self.core_refresh_every <= 0
                 or step_idx % self.core_refresh_every == 0
                 or use_xsa
             )
@@ -1075,6 +1076,7 @@ class GPT(nn.Module):
                 v_extra = self._compose_v_extra(virt, input_ids, ve_cache, value_residual_cache)
                 use_full_core = (
                     self.cheap_core is None
+                    or self.core_refresh_every <= 0
                     or step_idx % self.core_refresh_every == 0
                     or use_xsa
                 )
@@ -1528,6 +1530,15 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if len(base_model.mtp_heads) > 0:
+        optimizer_mtp = torch.optim.AdamW(
+            [{"params": list(base_model.mtp_heads.parameters()), "lr": args.head_lr, "base_lr": args.head_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            weight_decay=args.adam_wd,
+            fused=True,
+        )
+        optimizers.insert(1, optimizer_mtp)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
