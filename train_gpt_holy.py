@@ -110,6 +110,7 @@ class Hyperparameters:
     latent_core_kernel = int(os.environ.get("LATENT_CORE_KERNEL", 5))
     core_refresh_every = int(os.environ.get("CORE_REFRESH_EVERY", 0))
     cheap_core_bottleneck = int(os.environ.get("CHEAP_CORE_BOTTLENECK", 256))
+    muon_backend_steps_late = int(os.environ.get("MUON_BACKEND_STEPS_LATE", 3))
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
@@ -665,17 +666,39 @@ class SharedStepModulator(nn.Module):
             "mix": mix.to(dtype=dtype),
         }
 
+class LatentCrossAttention(nn.Module):
+    """Lightweight cross-attention: token queries attend to latent keys/values."""
+    def __init__(self, dim: int, num_heads: int = 4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.q_proj = CastedLinear(dim, dim, bias=False)
+        self.k_proj = CastedLinear(dim, dim, bias=False)
+        self.v_proj = CastedLinear(dim, dim, bias=False)
+        self.out_proj = CastedLinear(dim, dim, bias=False)
+        self.out_proj._zero_init = True
+        self.norm_q = RMSNorm()
+        self.norm_kv = RMSNorm()
+    def forward(self, x_tok: Tensor, z_latent: Tensor) -> Tensor:
+        B, T, D = x_tok.shape
+        L = z_latent.size(1)
+        q = self.q_proj(self.norm_q(x_tok)).reshape(B, T, self.num_heads, self.head_dim)
+        kv_in = self.norm_kv(z_latent)
+        k = self.k_proj(kv_in).reshape(B, L, self.num_heads, self.head_dim)
+        v = self.v_proj(kv_in).reshape(B, L, self.num_heads, self.head_dim)
+        y = attention_backend(q, k, v, causal=False)
+        return self.out_proj(y.reshape(B, T, D))
+
 class LatentBottleneck(nn.Module):
-    def __init__(self, dim: int, stride: int, kernel_size: int = 5):
+    def __init__(self, dim: int, stride: int, kernel_size: int = 5, num_heads: int = 4):
         super().__init__()
         self.stride = max(1, stride)
         self.kernel_size = max(1, kernel_size | 1)
         self.norm = RMSNorm()
         self.down_proj = CastedLinear(dim, dim, bias=False)
         self.down_conv = nn.Conv1d(dim, dim, self.kernel_size, stride=self.stride, groups=dim, bias=False)
-        self.up_proj = CastedLinear(dim, dim, bias=False)
+        self.cross_attn = LatentCrossAttention(dim, num_heads=num_heads)
         nn.init.orthogonal_(self.down_proj.weight, gain=1.0)
-        nn.init.orthogonal_(self.up_proj.weight, gain=0.05)
         with torch.no_grad():
             self.down_conv.weight.zero_()
             self.down_conv.weight[:, 0, -1] = 1.0
@@ -684,11 +707,9 @@ class LatentBottleneck(nn.Module):
         h = self.down_proj(h)
         h = F.pad(h.transpose(1, 2), (self.kernel_size - 1, 0))
         return self.down_conv(h).transpose(1, 2)
-    def decompress(self, z: Tensor, target_len: int) -> Tensor:
-        if target_len <= 0:
-            return z.new_zeros(z.size(0), 0, z.size(-1))
-        x = z.repeat_interleave(self.stride, dim=1)[:, :target_len, :]
-        return self.up_proj(x)
+    def decompress(self, x_tok: Tensor, z_latent: Tensor) -> Tensor:
+        """Cross-attention readout: token states query refined latent states."""
+        return self.cross_attn(x_tok, z_latent)
 
 class CheapCoreBlock(nn.Module):
     def __init__(
@@ -878,6 +899,7 @@ class GPT(nn.Module):
                 model_dim,
                 self.latent_core_stride,
                 kernel_size=self.latent_core_kernel,
+                num_heads=num_heads,
             )
             if self.latent_core_enabled
             else None
@@ -1037,6 +1059,7 @@ class GPT(nn.Module):
             virt += 1
         latent_x = None
         latent_x0 = None
+        latent_v_extra_cache = None
         if self.latent_bridge is not None:
             latent_x = self.latent_bridge.compress(x)
             latent_x0 = self.latent_bridge.compress(x0)
@@ -1045,13 +1068,13 @@ class GPT(nn.Module):
             step_mod = self.level_mod(step_idx, dtype=x.dtype)
             v_extra = self._compose_v_extra(virt, input_ids, ve_cache, value_residual_cache)
             if self.latent_bridge is not None:
-                latent_v_extra = self.latent_bridge.compress(v_extra) if v_extra is not None else None
-                latent_x = block(latent_x, latent_x0, v_embed=latent_v_extra, step_mod=step_mod)
+                if v_extra is not None and latent_v_extra_cache is None:
+                    latent_v_extra_cache = self.latent_bridge.compress(v_extra)
+                latent_x = block(latent_x, latent_x0, v_embed=latent_v_extra_cache, step_mod=step_mod)
             else:
                 use_full_core = (
                     self.cheap_core is None
                     or step_idx % self.core_refresh_every == 0
-                    or block.attn.use_xsa
                 )
                 if use_full_core:
                     x = block(x, x0, v_embed=v_extra, step_mod=step_mod)
@@ -1059,7 +1082,7 @@ class GPT(nn.Module):
                     x = self.cheap_core(x, x0, v_embed=v_extra, step_mod=step_mod)
             virt += 1
         if self.latent_bridge is not None and latent_x is not None:
-            x = x + self.latent_bridge.decompress(latent_x, x.size(1))
+            x = x + self.latent_bridge.decompress(x, latent_x)
         for block in self.tail_blocks:
             v_extra = self._compose_v_extra(virt, input_ids, ve_cache, value_residual_cache)
             x = block(x, x0, v_embed=v_extra)
@@ -1661,6 +1684,9 @@ def main() -> None:
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
+        effective_backend_steps = args.muon_backend_steps_late if scale < 1.0 else args.muon_backend_steps
+        for group in optimizer_muon.param_groups:
+            group["backend_steps"] = effective_backend_steps
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
