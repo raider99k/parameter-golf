@@ -901,6 +901,25 @@ class GPT(nn.Module):
             if self.latent_core_enabled
             else None
         )
+        self.xsa_virtual_layer_indices = set()
+        if xsa_last_n > 0:
+            start_xsa = max(0, self.virtual_num_layers - xsa_last_n)
+            self.xsa_virtual_layer_indices = set(range(start_xsa, self.virtual_num_layers))
+
+        planned_cheap_use = False
+        virt_c = self.interface_layers
+        for step_idx, _ in enumerate(self.core_schedule):
+            use_xsa = virt_c in self.xsa_virtual_layer_indices
+            use_full = (
+                self.latent_bridge is not None
+                or step_idx % self.core_refresh_every == 0
+                or use_xsa
+            )
+            if not use_full:
+                planned_cheap_use = True
+                break
+            virt_c += 1
+
         self.cheap_core = (
             CheapCoreBlock(
                 model_dim,
@@ -909,7 +928,7 @@ class GPT(nn.Module):
                 ln_scale=ln_scale,
                 dtg=dtg,
             )
-            if self.latent_bridge is None and self.core_refresh_every > 1 and self.shared_depth > 1
+            if self.latent_bridge is None and self.core_refresh_every > 1 and self.shared_depth > 1 and planned_cheap_use
             else None
         )
         self.blocks = nn.ModuleList(list(self.interface_blocks) + list(self.core_bank) + list(self.tail_blocks))
@@ -931,10 +950,13 @@ class GPT(nn.Module):
             self.ve_layer_scales = nn.ParameterList()
         self.value_residual = value_residual
         self.value_residual_init = value_residual_init
-        self.value_residual_scales = nn.Parameter(torch.full((self.virtual_num_layers,), value_residual_init, dtype=torch.float32))
-        if self.virtual_num_layers > 0:
-            with torch.no_grad():
-                self.value_residual_scales[0].zero_()
+        if self.value_residual:
+            self.value_residual_scales = nn.Parameter(torch.full((self.virtual_num_layers,), value_residual_init, dtype=torch.float32))
+            if self.virtual_num_layers > 0:
+                with torch.no_grad():
+                    self.value_residual_scales[0].zero_()
+        else:
+            self.register_parameter("value_residual_scales", None)
         self.value_embeds = nn.ModuleList()
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -947,11 +969,6 @@ class GPT(nn.Module):
         else:
             self.mtp_heads = nn.ModuleList()
             self.mtp_num_heads = 0
-        self.xsa_virtual_layer_indices = set()
-        if xsa_last_n > 0:
-            start_xsa = max(0, self.virtual_num_layers - xsa_last_n)
-            self.xsa_virtual_layer_indices = set(range(start_xsa, self.virtual_num_layers))
-        
         used_banks = set()
         virt = self.interface_layers
         for step_idx, bank_idx in enumerate(self.core_schedule):
