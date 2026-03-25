@@ -1,5 +1,6 @@
 from __future__ import annotations
 import copy
+from collections import deque
 import glob
 import io
 import math
@@ -77,6 +78,9 @@ class Hyperparameters:
     muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_every = int(os.environ.get("SWA_EVERY", 50))
+    lawa_enabled = bool(int(os.environ.get("LAWA_ENABLED", "0")))
+    lawa_k = int(os.environ.get("LAWA_K", 10))
+    lawa_freq = int(os.environ.get("LAWA_FREQ", 100))
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
@@ -1303,6 +1307,8 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    if args.lawa_enabled:
+        log0(f"lawa:enabled k:{args.lawa_k} freq:{args.lawa_freq}")
     log0(f"seed:{args.seed}")
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     def zero_grad_all() -> None:
@@ -1357,6 +1363,7 @@ def main() -> None:
     swa_count = 0
     ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
     ema_decay = args.ema_decay
+    lawa_queue: deque[dict[str, Tensor]] = deque(maxlen=max(1, args.lawa_k)) if args.lawa_enabled else deque()
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1436,6 +1443,8 @@ def main() -> None:
                 for name, t in base_model.state_dict().items():
                     swa_state[name] += t.detach().cpu()
                 swa_count += 1
+        if args.lawa_enabled and args.lawa_freq > 0 and step % args.lawa_freq == 0:
+            lawa_queue.append({name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()})
         should_log_train = (
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
@@ -1457,18 +1466,54 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
     current_state = base_model.state_dict()
-    # Apply EMA or SWA weights
-    if args.swa_enabled and swa_state is not None and swa_count > 0 and args.ema_decay <= 0.0:
-        log0(f"swa:applying averaged_weights count:{swa_count}")
-        avg_state = {name: (t / float(swa_count)).to(dtype=current_state[name].dtype) for name, t in swa_state.items()}
-        base_model.load_state_dict(avg_state, strict=True)
-    elif args.ema_decay > 0.0:
-        log0("ema:applying EMA weights")
-        current_state = base_model.state_dict()
-        avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
-        base_model.load_state_dict(avg_state, strict=True)
-    else:
-        log0("ema:disabled using final weights")
+    final_candidates: list[tuple[str, dict[str, Tensor]]] = []
+    raw_state = {name: t.detach().cpu().clone() for name, t in current_state.items()}
+    final_candidates.append(("raw", raw_state))
+    if args.ema_decay > 0.0:
+        final_candidates.append(("ema", {name: t.detach().cpu().clone() for name, t in ema_state.items()}))
+    if args.swa_enabled and swa_state is not None and swa_count > 0:
+        final_candidates.append(("swa", {name: (t / float(swa_count)).detach().cpu().clone() for name, t in swa_state.items()}))
+    if args.lawa_enabled and len(lawa_queue) > 1:
+        lawa_state = {name: torch.zeros_like(t, dtype=torch.float32, device="cpu") for name, t in current_state.items()}
+        for snapshot in lawa_queue:
+            for name, t in snapshot.items():
+                lawa_state[name].add_(t.float())
+        inv_k = 1.0 / float(len(lawa_queue))
+        final_candidates.append(("lawa", {name: (t * inv_k) for name, t in lawa_state.items()}))
+    best_label = "raw"
+    best_state = raw_state
+    best_val_loss = float("inf")
+    best_val_bpb = float("inf")
+    if len(final_candidates) == 1:
+        log0("final_selection:raw_only")
+    for label, candidate_state in final_candidates:
+        base_model.load_state_dict(candidate_state, strict=True)
+        torch.cuda.synchronize()
+        t_candidate = time.perf_counter()
+        cand_val_loss, cand_val_bpb = eval_val(
+            args,
+            compiled_model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_candidate:{label} val_loss:{cand_val_loss:.4f} val_bpb:{cand_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_candidate):.0f}ms"
+        )
+        if cand_val_loss < best_val_loss:
+            best_label = label
+            best_state = candidate_state
+            best_val_loss = cand_val_loss
+            best_val_bpb = cand_val_bpb
+    log0(f"final_selection:{best_label} val_loss:{best_val_loss:.4f} val_bpb:{best_val_bpb:.4f}")
+    base_model.load_state_dict(best_state, strict=True)
     torch.cuda.synchronize()
     t_diag = time.perf_counter()
     diag_val_loss, diag_val_bpb = eval_val(
@@ -1477,7 +1522,7 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"DIAGNOSTIC post_ema val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
+        f"DIAGNOSTIC post_select val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
     )
     full_state_dict = base_model.state_dict()
