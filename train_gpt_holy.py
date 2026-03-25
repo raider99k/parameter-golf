@@ -918,7 +918,8 @@ class GPT(nn.Module):
             for block in self.blocks:
                 block.attn.rope_dims = rope_dims
                 block.attn.rotary = Rotary(head_dim, base=rope_base, train_seq_len=1024, rope_dims=rope_dims)
-        self.ve_layer_indices = [int(x) for x in ve_layers.split(",") if x.strip()] if ve_enabled and ve_layers.strip() else []
+        parsed_ve = [int(x) for x in ve_layers.split(",") if x.strip()] if ve_enabled and ve_layers.strip() else []
+        self.ve_layer_indices = sorted(list(set(i for i in parsed_ve if 0 <= i < self.virtual_num_layers)))
         kv_dim = self._ve_target_dim
         if self.ve_layer_indices:
             self.ve_shared = ValueEmbedding(vocab_size, ve_dim, kv_dim)
@@ -939,9 +940,13 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        self.mtp_heads = nn.ModuleList([CastedLinear(model_dim, vocab_size, bias=False) for _ in range(mtp_num_heads)])
-        for head in self.mtp_heads:
-            head._zero_init = True
+        if mtp_num_heads > 0 and mtp_loss_weight > 0.0:
+            self.mtp_heads = nn.ModuleList([CastedLinear(model_dim, vocab_size, bias=False) for _ in range(mtp_num_heads)])
+            for head in self.mtp_heads:
+                head._zero_init = True
+        else:
+            self.mtp_heads = nn.ModuleList()
+            self.mtp_num_heads = 0
         self.xsa_virtual_layer_indices = set()
         if xsa_last_n > 0:
             start_xsa = max(0, self.virtual_num_layers - xsa_last_n)
