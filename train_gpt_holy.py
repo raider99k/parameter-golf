@@ -1035,29 +1035,39 @@ def _classify_param(name: str) -> str:
 def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
-        # Match the QAT surrogate used in CastedLinear.forward so export
-        # is evaluated against the same row-wise quantizer the model adapts to.
-        row_max = t32.abs().amax(dim=1)
-        scale = (row_max / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
-        q = torch.clamp(torch.round(t32 / scale.float()[:, None]), -32, clip_range).to(torch.int8)
-        return q, scale
+        best_q, best_s, best_err = None, None, float('inf')
+        for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
+            if pct < 1.0:
+                row_clip = torch.quantile(t32.abs(), pct, dim=1)
+            else:
+                row_clip = t32.abs().amax(dim=1)
+            s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
+            q = torch.clamp(torch.round(t32 / s.float()[:, None]), -clip_range, clip_range).to(torch.int8)
+            recon = q.float() * s.float()[:, None]
+            err = (t32 - recon).pow(2).mean().item()
+            if err < best_err:
+                best_q, best_s, best_err = q, s, err
+        return best_q, best_s
     amax = t32.abs().max().item()
     scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)
-    q = torch.clamp(torch.round(t32 / scale.float()), -32, clip_range).to(torch.int8)
+    q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
     return q, scale
 def mixed_quantize_int6(
     state_dict: dict[str, Tensor],
     int6_cats: set[str],
     passthrough_fp16_names: set[str] | None = None,
-    force_int8_patterns: tuple[str, ...] = (),
 ):
+    num_layers_total = max(
+        (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
+        default=0,
+    ) + 1
+    late_k_layers = set(range(num_layers_total - 2, num_layers_total))
     passthrough_fp16_names = passthrough_fp16_names or set()
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     for name, tensor in state_dict.items():
         t = tensor.detach().cpu().contiguous()
         cat = _classify_param(name)
-        force_int8 = any(pattern in name for pattern in force_int8_patterns)
         if not t.is_floating_point() or t.numel() <= 65536:
             result[name] = t.to(torch.float16) if t.is_floating_point() else t
             meta[name] = "passthrough"
@@ -1070,7 +1080,7 @@ def mixed_quantize_int6(
             result[name] = t.to(torch.float16)
             meta[name] = "passthrough_fp16"
             continue
-        if cat in int6_cats and t.ndim >= 1 and not force_int8:
+        if cat in int6_cats and t.ndim >= 1:
             q, s = quantize_int6_per_row(t)
             result[name + ".q"] = q
             result[name + ".scale"] = s
@@ -1485,8 +1495,11 @@ def main() -> None:
     quant_result, quant_meta = mixed_quantize_int6(
         sd_cpu,
         {"mlp", "attn"},
-        set(),
-        ("tail_blocks.",),
+        {
+            "tok_emb.weight",
+            "bigram.embed.weight",
+            "ve_shared.embed.weight",
+        },
     )
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
