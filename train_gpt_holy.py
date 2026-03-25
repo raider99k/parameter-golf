@@ -556,7 +556,6 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rope_dims = 0  # set by GPT.__init__ for partial RoPE
         self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=1024)
-        self.use_xsa = False  # set by GPT.__init__ for deep layers only
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
         """Efficient XSA: subtract self-value projection via GQA-aware reshape (no repeat_interleave).
         y: [B, T, H, D], v: [B, T, Hkv, D]. H must be divisible by Hkv."""
@@ -567,7 +566,7 @@ class CausalSelfAttention(nn.Module):
         vn = F.normalize(v, dim=-1).unsqueeze(-2)    # [B, T, Hkv, 1, D] — broadcast ready
         proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
         return (y_g - proj).reshape(B, T, H, D)
-    def forward(self, x: Tensor, v_embed: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, v_embed: Tensor | None = None, use_xsa: bool = False) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
@@ -582,7 +581,7 @@ class CausalSelfAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
         y = attention_backend(q, k, v, causal=True)
-        if self.use_xsa:
+        if use_xsa:
             y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
         return self.proj(y)
@@ -743,15 +742,12 @@ class CheapCoreBlock(nn.Module):
         self,
         x: Tensor,
         x0: Tensor,
-        v_embed: Tensor | None = None,
         step_mod: dict[str, Tensor] | None = None,
     ) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         if step_mod is not None:
             mix = mix + step_mod["mix"]
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        if v_embed is not None:
-            x_in = x_in + v_embed
         h = self.norm(x_in) * self.ln_scale_factor
         local = self.dwconv(h.transpose(1, 2)).transpose(1, 2)
         if step_mod is not None:
@@ -801,12 +797,13 @@ class Block(nn.Module):
         x0: Tensor,
         v_embed: Tensor | None = None,
         step_mod: dict[str, Tensor] | None = None,
+        use_xsa: bool = False,
     ) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         if step_mod is not None:
             mix = mix + step_mod["mix"]
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
+        attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed, use_xsa=use_xsa)
         attn_scale = self.attn_scale.to(dtype=x.dtype)
         mlp_scale = self.mlp_scale.to(dtype=x.dtype)
         if step_mod is not None:
@@ -945,48 +942,13 @@ class GPT(nn.Module):
         self.mtp_heads = nn.ModuleList([CastedLinear(model_dim, vocab_size, bias=False) for _ in range(mtp_num_heads)])
         for head in self.mtp_heads:
             head._zero_init = True
-        self._assign_xsa(xsa_last_n)
+        self.xsa_virtual_layer_indices = set()
+        if xsa_last_n > 0:
+            start_xsa = max(0, self.virtual_num_layers - xsa_last_n)
+            self.xsa_virtual_layer_indices = set(range(start_xsa, self.virtual_num_layers))
         self._init_weights()
-    def _assign_xsa(self, xsa_last_n: int) -> None:
-        if xsa_last_n <= 0:
-            return
-        remaining = xsa_last_n
-        for block in reversed(self.tail_blocks):
-            if remaining <= 0:
-                break
-            block.attn.use_xsa = True
-            remaining -= 1
-        if remaining > 0 and len(self.core_bank) > 0:
-            if len(self.core_bank) == 1:
-                self.core_bank[0].attn.use_xsa = True
-            else:
-                for block in reversed(self.core_bank):
-                    if remaining <= 0:
-                        break
-                    block.attn.use_xsa = True
-                    remaining -= 1
-        if remaining > 0:
-            for block in reversed(self.interface_blocks):
-                if remaining <= 0:
-                    break
-                block.attn.use_xsa = True
-                remaining -= 1
     def virtual_xsa_layers(self) -> list[int]:
-        layers = []
-        virt = 0
-        for block in self.interface_blocks:
-            if block.attn.use_xsa:
-                layers.append(virt)
-            virt += 1
-        for bank_idx in self.core_schedule:
-            if self.core_bank[bank_idx].attn.use_xsa:
-                layers.append(virt)
-            virt += 1
-        for block in self.tail_blocks:
-            if block.attn.use_xsa:
-                layers.append(virt)
-            virt += 1
-        return layers
+        return sorted([v for v in self.xsa_virtual_layer_indices if v < self.virtual_num_layers])
     def arch_summary(self) -> str:
         core_mode = "latent" if self.latent_bridge is not None else ("hybrid" if self.cheap_core is not None else "full")
         extra = ""
@@ -1055,11 +1017,10 @@ class GPT(nn.Module):
         virt = 0
         for block in self.interface_blocks:
             v_extra = self._compose_v_extra(virt, input_ids, ve_cache, value_residual_cache)
-            x = block(x, x0, v_embed=v_extra)
+            x = block(x, x0, v_embed=v_extra, use_xsa=(virt in self.xsa_virtual_layer_indices))
             virt += 1
         latent_x = None
         latent_x0 = None
-        latent_v_extra_cache = None
         if self.latent_bridge is not None:
             latent_x = self.latent_bridge.compress(x)
             latent_x0 = self.latent_bridge.compress(x0)
@@ -1067,25 +1028,24 @@ class GPT(nn.Module):
             block = self.core_bank[bank_idx]
             step_mod = self.level_mod(step_idx, dtype=x.dtype)
             v_extra = self._compose_v_extra(virt, input_ids, ve_cache, value_residual_cache)
+            use_xsa = (virt in self.xsa_virtual_layer_indices)
             if self.latent_bridge is not None:
-                if v_extra is not None and latent_v_extra_cache is None:
-                    latent_v_extra_cache = self.latent_bridge.compress(v_extra)
-                latent_x = block(latent_x, latent_x0, v_embed=latent_v_extra_cache, step_mod=step_mod)
+                latent_x = block(latent_x, latent_x0, v_embed=None, step_mod=step_mod, use_xsa=use_xsa)
             else:
                 use_full_core = (
                     self.cheap_core is None
                     or step_idx % self.core_refresh_every == 0
                 )
                 if use_full_core:
-                    x = block(x, x0, v_embed=v_extra, step_mod=step_mod)
+                    x = block(x, x0, v_embed=v_extra, step_mod=step_mod, use_xsa=use_xsa)
                 else:
-                    x = self.cheap_core(x, x0, v_embed=v_extra, step_mod=step_mod)
+                    x = self.cheap_core(x, x0, step_mod=step_mod)
             virt += 1
         if self.latent_bridge is not None and latent_x is not None:
             x = x + self.latent_bridge.decompress(x, latent_x)
         for block in self.tail_blocks:
             v_extra = self._compose_v_extra(virt, input_ids, ve_cache, value_residual_cache)
-            x = block(x, x0, v_embed=v_extra)
+            x = block(x, x0, v_embed=v_extra, use_xsa=(virt in self.xsa_virtual_layer_indices))
             virt += 1
         return self.final_norm(x)
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -1696,9 +1656,10 @@ def main() -> None:
             opt.step()
         zero_grad_all()
         # EMA update
-        with torch.no_grad():
-            for name, t in base_model.state_dict().items():
-                ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
+        if ema_decay > 0.0:
+            with torch.no_grad():
+                for name, t in base_model.state_dict().items():
+                    ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         if args.swa_enabled and scale < 0.2 and step % args.swa_every == 0:
