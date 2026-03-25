@@ -946,6 +946,25 @@ class GPT(nn.Module):
         if xsa_last_n > 0:
             start_xsa = max(0, self.virtual_num_layers - xsa_last_n)
             self.xsa_virtual_layer_indices = set(range(start_xsa, self.virtual_num_layers))
+        
+        used_banks = set()
+        virt = self.interface_layers
+        for step_idx, bank_idx in enumerate(self.core_schedule):
+            use_xsa = virt in self.xsa_virtual_layer_indices
+            use_full = (
+                self.latent_bridge is not None
+                or self.cheap_core is None
+                or step_idx % self.core_refresh_every == 0
+                or use_xsa
+            )
+            if use_full:
+                used_banks.add(bank_idx)
+            virt += 1
+        if len(self.core_bank) > 0 and used_banks != set(range(len(self.core_bank))):
+            unused = set(range(len(self.core_bank))) - used_banks
+            raise ValueError(f"Configuration leaves physical core banks unused: {unused}. "
+                             f"This will cause DDP to crash with find_unused_parameters=False.")
+
         self._init_weights()
     def virtual_xsa_layers(self) -> list[int]:
         return sorted([v for v in self.xsa_virtual_layer_indices if v < self.virtual_num_layers])
