@@ -92,7 +92,13 @@ class Hyperparameters:
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
+    normformer_lite = bool(int(os.environ.get("NORMFORMER_LITE", "0")))
+    depth_aware_init = bool(int(os.environ.get("DEPTH_AWARE_INIT", "0")))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
+    compression_reg_weight = float(os.environ.get("COMPRESSION_REG_WEIGHT", 0.0))
+    compression_reg_start_frac = float(os.environ.get("COMPRESSION_REG_START_FRAC", 0.5))
+    compression_reg_every_steps = int(os.environ.get("COMPRESSION_REG_EVERY_STEPS", 4))
+    compression_project_every_steps = int(os.environ.get("COMPRESSION_PROJECT_EVERY_STEPS", 0))
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "")
@@ -775,10 +781,13 @@ class Block(nn.Module):
         layer_idx: int = 0,
         ln_scale: bool = False,
         dtg: bool = False,
+        normformer_lite: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
+        self.attn_post_norm = RMSNorm() if normformer_lite else nn.Identity()
+        self.mlp_post_norm = RMSNorm() if normformer_lite else nn.Identity()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -809,8 +818,14 @@ class Block(nn.Module):
         if step_mod is not None:
             attn_scale = attn_scale * (1.0 + step_mod["attn"])
             mlp_scale = mlp_scale * (1.0 + step_mod["mlp"])
+
+        attn_out = self.attn_post_norm(attn_out)
         x_out = x_in + attn_scale[None, None, :] * attn_out
-        x_out = x_out + mlp_scale[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
+        
+        mlp_out = self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
+        mlp_out = self.mlp_post_norm(mlp_out)
+        x_out = x_out + mlp_scale[None, None, :] * mlp_out
+        
         if self.dtg_gate is not None:
             gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
             x_out = x_in + gate * (x_out - x_in)
@@ -849,11 +864,12 @@ class GPT(nn.Module):
         shared_depth: int = 8,
         level_dim: int = 24,
         level_scale: float = 0.08,
-        latent_core_enabled: bool = False,
         latent_core_stride: int = 4,
         latent_core_kernel: int = 5,
         core_refresh_every: int = 0,
         cheap_core_bottleneck: int = 256,
+        normformer_lite: bool = False,
+        depth_aware_init: bool = False,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)
@@ -878,17 +894,38 @@ class GPT(nn.Module):
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
         self.interface_blocks = nn.ModuleList([
-            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=i, ln_scale=ln_scale, dtg=dtg)
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=i, ln_scale=ln_scale, dtg=dtg, normformer_lite=normformer_lite)
             for i in range(self.interface_layers)
         ])
         self.core_bank = nn.ModuleList([
-            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=self.interface_layers + i, ln_scale=ln_scale, dtg=dtg)
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=self.interface_layers + i, ln_scale=ln_scale, dtg=dtg, normformer_lite=normformer_lite)
             for i in range(self.num_shared_cores)
         ])
         self.tail_blocks = nn.ModuleList([
-            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=self.interface_layers + self.shared_depth + i, ln_scale=ln_scale, dtg=dtg)
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=self.interface_layers + self.shared_depth + i, ln_scale=ln_scale, dtg=dtg, normformer_lite=normformer_lite)
             for i in range(self.tail_layers)
         ])
+
+        if depth_aware_init:
+            def depth_aware_branch_scale(n: int) -> float:
+                return (2.0 * max(n, 1)) ** -0.5
+            
+            with torch.no_grad():
+                for i, block in enumerate(self.interface_blocks):
+                    scale = depth_aware_branch_scale(i + 1)
+                    block.attn_scale.fill_(scale)
+                    block.mlp_scale.fill_(scale)
+                for block in self.core_bank:
+                    # Initialize core blocks as if they run at mid-depth on average
+                    center_virtual_depth = self.interface_layers + (self.shared_depth // 2) + 1
+                    scale = depth_aware_branch_scale(center_virtual_depth)
+                    block.attn_scale.fill_(scale)
+                    block.mlp_scale.fill_(scale)
+                for i, block in enumerate(self.tail_blocks):
+                    virtual_depth = self.interface_layers + self.shared_depth + i + 1
+                    scale = depth_aware_branch_scale(virtual_depth)
+                    block.attn_scale.fill_(scale)
+                    block.mlp_scale.fill_(scale)
         self.core_schedule = [i % self.num_shared_cores for i in range(self.shared_depth)]
         self.level_mod = SharedStepModulator(self.shared_depth, level_dim, model_dim, level_scale)
         self.latent_bridge = (
@@ -1328,6 +1365,55 @@ def mixed_quantize_int6(
             result[name + ".scale"] = s
             meta[name] = {"type": "int8", "aliases": aliases_by_canonical.get(name, [name])[1:]}
     return result, meta
+
+def get_int6_export_params(
+    model: nn.Module,
+    int6_cats: set[str],
+    passthrough_fp16_names: set[str],
+    canonical_by_name: dict[str, str],
+) -> tuple[tuple[str, Tensor], ...]:
+    params: list[tuple[str, Tensor]] = []
+    for name, param in model.named_parameters():
+        canonical_name = canonical_by_name.get(name, name)
+        if canonical_name != name:
+            continue
+        if not param.is_floating_point() or param.numel() <= 65536:
+            continue
+        if any(p in canonical_name for p in CONTROL_TENSOR_NAME_PATTERNS):
+            continue
+        if canonical_name in passthrough_fp16_names:
+            continue
+        if _classify_param(canonical_name) not in int6_cats or param.ndim < 1:
+            continue
+        params.append((canonical_name, param))
+    return tuple(params)
+
+def compute_export_grid_regularizer_int6(
+    model: nn.Module,
+    int6_cats: set[str],
+    passthrough_fp16_names: set[str],
+    canonical_by_name: dict[str, str],
+) -> Tensor:
+    penalties: list[Tensor] = []
+    for name, param in get_int6_export_params(model, int6_cats, passthrough_fp16_names, canonical_by_name):
+        q, s = quantize_int6_per_row(param.detach())
+        recon = q.float() * s.float()[:, None]
+        penalties.append((param.float() - recon.float()).square().mean())
+    if not penalties:
+        return torch.zeros((), device=next(model.parameters()).device)
+    return torch.stack(penalties).mean()
+
+@torch.no_grad()
+def project_model_to_int6_grid(
+    model: nn.Module,
+    int6_cats: set[str],
+    passthrough_fp16_names: set[str],
+    canonical_by_name: dict[str, str],
+) -> None:
+    for name, param in get_int6_export_params(model, int6_cats, passthrough_fp16_names, canonical_by_name):
+        q, s = quantize_int6_per_row(param.data)
+        recon = q.float() * s.float()[:, None]
+        param.data.copy_(recon.to(dtype=param.dtype))
 def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
                           template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
@@ -1641,6 +1727,15 @@ def main() -> None:
     ema_decay = args.ema_decay
     ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()} if ema_decay > 0.0 else {}
     lawa_queue: deque[dict[str, Tensor]] = deque(maxlen=max(1, args.lawa_k)) if args.lawa_enabled else deque()
+
+    # Pre-build parameter alias info once prior to the loop for use by the reg
+    canonical_by_name, aliases_by_canonical, reuse_count_by_canonical = build_parameter_alias_groups(base_model)
+    export_fp16_base_names = {
+        "tok_emb.weight",
+        "bigram.embed.weight",
+        "ve_shared.embed.weight",
+    }
+
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1692,6 +1787,12 @@ def main() -> None:
                 loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
+
+        if args.compression_reg_weight > 0.0 and step >= int(args.iterations * args.compression_reg_start_frac) and step % args.compression_reg_every_steps == 0:
+            reg = compute_export_grid_regularizer_int6(base_model, {"mlp", "attn"}, export_fp16_base_names, canonical_by_name)
+            (args.compression_reg_weight * reg).backward()
+            train_loss += (args.compression_reg_weight * reg).detach()
+
         train_loss /= grad_accum_steps
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
@@ -1708,6 +1809,10 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+
+        if args.compression_project_every_steps > 0 and step >= int(args.iterations * args.compression_reg_start_frac) and step % args.compression_project_every_steps == 0:
+            project_model_to_int6_grid(base_model, {"mlp", "attn"}, export_fp16_base_names, canonical_by_name)
+
         # EMA update
         if ema_decay > 0.0:
             with torch.no_grad():
@@ -1761,12 +1866,7 @@ def main() -> None:
                 lawa_state[name].add_(t.float())
         inv_k = 1.0 / float(len(lawa_queue))
         final_candidates.append(("lawa", {name: (t * inv_k) for name, t in lawa_state.items()}))
-    canonical_by_name, aliases_by_canonical, reuse_count_by_canonical = build_parameter_alias_groups(base_model)
-    export_fp16_base_names = {
-        "tok_emb.weight",
-        "bigram.embed.weight",
-        "ve_shared.embed.weight",
-    }
+    
     eval_model = GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
