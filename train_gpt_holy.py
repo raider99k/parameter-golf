@@ -1052,12 +1052,17 @@ def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
     scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)
     q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
     return q, scale
-def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
+def mixed_quantize_int6(
+    state_dict: dict[str, Tensor],
+    int6_cats: set[str],
+    passthrough_fp16_names: set[str] | None = None,
+):
     num_layers_total = max(
         (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
         default=0,
     ) + 1
     late_k_layers = set(range(num_layers_total - 2, num_layers_total))
+    passthrough_fp16_names = passthrough_fp16_names or set()
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     for name, tensor in state_dict.items():
@@ -1070,6 +1075,10 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
         if any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS):
             result[name] = t.float()
             meta[name] = "passthrough_ctrl"
+            continue
+        if name in passthrough_fp16_names:
+            result[name] = t.to(torch.float16)
+            meta[name] = "passthrough_fp16"
             continue
         if cat in int6_cats and t.ndim >= 1:
             q, s = quantize_int6_per_row(t)
@@ -1483,7 +1492,15 @@ def main() -> None:
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
-    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"})
+    quant_result, quant_meta = mixed_quantize_int6(
+        sd_cpu,
+        {"mlp", "attn"},
+        {
+            "tok_emb.weight",
+            "bigram.embed.weight",
+            "ve_shared.embed.weight",
+        },
+    )
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
