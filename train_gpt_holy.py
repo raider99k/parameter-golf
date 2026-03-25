@@ -1067,79 +1067,118 @@ def int6_tensor_quantization_score(t: Tensor) -> float:
     mse = (t32 - recon).pow(2).mean().item()
     energy = t32.pow(2).mean().item()
     return mse if energy <= 0.0 else mse / energy
+def build_parameter_alias_groups(module: nn.Module) -> tuple[dict[str, str], dict[str, list[str]], dict[str, int]]:
+    canonical_by_name: dict[str, str] = {}
+    aliases_by_canonical: dict[str, list[str]] = {}
+    seen_param_ids: dict[int, str] = {}
+    for name, param in module.named_parameters(remove_duplicate=False):
+        canonical_name = seen_param_ids.setdefault(id(param), name)
+        canonical_by_name[name] = canonical_name
+        aliases_by_canonical.setdefault(canonical_name, []).append(name)
+    reuse_count_by_canonical = {name: len(names) for name, names in aliases_by_canonical.items()}
+    return canonical_by_name, aliases_by_canonical, reuse_count_by_canonical
 def select_sensitive_fp16_names(
     state_dict: dict[str, Tensor],
     int6_cats: set[str],
     passthrough_fp16_names: set[str] | None = None,
+    canonical_by_name: dict[str, str] | None = None,
+    aliases_by_canonical: dict[str, list[str]] | None = None,
+    reuse_count_by_canonical: dict[str, int] | None = None,
     topk: int = 0,
     min_score: float = 0.0,
 ) -> set[str]:
     if topk <= 0:
         return set()
     passthrough_fp16_names = passthrough_fp16_names or set()
+    canonical_by_name = canonical_by_name or {}
+    aliases_by_canonical = aliases_by_canonical or {}
+    reuse_count_by_canonical = reuse_count_by_canonical or {}
     scored: list[tuple[float, str]] = []
-    for name, tensor in state_dict.items():
-        if name in passthrough_fp16_names:
+    if aliases_by_canonical:
+        canonical_items = aliases_by_canonical.items()
+    else:
+        canonical_items = ((name, [name]) for name in state_dict.keys())
+    for canonical_name, alias_names in canonical_items:
+        if canonical_name in passthrough_fp16_names or any(alias in passthrough_fp16_names for alias in alias_names):
             continue
-        if not tensor.is_floating_point() or tensor.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+        tensor_name = canonical_name if canonical_name in state_dict else alias_names[0]
+        tensor = state_dict.get(tensor_name)
+        if tensor is None or not tensor.is_floating_point() or tensor.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
             continue
-        if any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
+        if any(pattern in tensor_name for pattern in CONTROL_TENSOR_NAME_PATTERNS):
             continue
-        if _classify_param(name) not in int6_cats:
+        if _classify_param(tensor_name) not in int6_cats:
             continue
         score = int6_tensor_quantization_score(tensor)
+        score *= float(reuse_count_by_canonical.get(canonical_name, len(alias_names)))
         if score >= min_score:
-            scored.append((score, name))
+            scored.append((score, canonical_name))
     scored.sort(reverse=True)
-    return {name for _, name in scored[:topk]}
+    selected_names = set(passthrough_fp16_names)
+    for _, canonical_name in scored[:topk]:
+        selected_names.update(aliases_by_canonical.get(canonical_name, [canonical_name]))
+    return selected_names
 def mixed_quantize_int6(
     state_dict: dict[str, Tensor],
     int6_cats: set[str],
     passthrough_fp16_names: set[str] | None = None,
+    canonical_by_name: dict[str, str] | None = None,
+    aliases_by_canonical: dict[str, list[str]] | None = None,
 ):
-    num_layers_total = max(
-        (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
-        default=0,
-    ) + 1
-    late_k_layers = set(range(num_layers_total - 2, num_layers_total))
     passthrough_fp16_names = passthrough_fp16_names or set()
+    canonical_by_name = canonical_by_name or {}
+    aliases_by_canonical = aliases_by_canonical or {}
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
+    meta["__alias_groups__"] = aliases_by_canonical
     for name, tensor in state_dict.items():
+        canonical_name = canonical_by_name.get(name, name)
+        if canonical_name != name:
+            continue
         t = tensor.detach().cpu().contiguous()
         cat = _classify_param(name)
         if not t.is_floating_point() or t.numel() <= 65536:
             result[name] = t.to(torch.float16) if t.is_floating_point() else t
-            meta[name] = "passthrough"
+            meta[name] = {"type": "passthrough", "aliases": aliases_by_canonical.get(name, [name])[1:]}
             continue
         if any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS):
             result[name] = t.float()
-            meta[name] = "passthrough_ctrl"
+            meta[name] = {"type": "passthrough_ctrl", "aliases": aliases_by_canonical.get(name, [name])[1:]}
             continue
         if name in passthrough_fp16_names:
             result[name] = t.to(torch.float16)
-            meta[name] = "passthrough_fp16"
+            meta[name] = {"type": "passthrough_fp16", "aliases": aliases_by_canonical.get(name, [name])[1:]}
             continue
         if cat in int6_cats and t.ndim >= 1:
             q, s = quantize_int6_per_row(t)
             result[name + ".q"] = q
             result[name + ".scale"] = s
-            meta[name] = {"type": "int6"}
+            meta[name] = {"type": "int6", "aliases": aliases_by_canonical.get(name, [name])[1:]}
         else:
             q, s = quantize_float_tensor(t)
             result[name + ".q"] = q
             result[name + ".scale"] = s
-            meta[name] = {"type": "int8"}
+            meta[name] = {"type": "int8", "aliases": aliases_by_canonical.get(name, [name])[1:]}
     return result, meta
 def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
                           template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
+    alias_groups = meta.get("__alias_groups__", {})
+    alias_to_canonical = {
+        alias: canonical
+        for canonical, aliases in alias_groups.items()
+        for alias in aliases
+        if alias != canonical
+    }
     for name, orig in template_sd.items():
+        canonical_name = alias_to_canonical.get(name, name)
+        if canonical_name != name:
+            continue
         info = meta.get(name)
         if info is None:
             continue
         orig_dtype = orig.dtype
-        if info in ("passthrough", "passthrough_ctrl", "passthrough_fp16"):
+        if isinstance(info, dict) and info.get("type") in ("passthrough", "passthrough_ctrl", "passthrough_fp16"):
             t = result[name]
             if t.dtype == torch.float16 and orig_dtype in (torch.float32, torch.bfloat16):
                 t = t.to(orig_dtype)
@@ -1150,6 +1189,11 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
             out[name] = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(orig_dtype)
         else:
             out[name] = (q.float() * float(s.item())).to(orig_dtype)
+        for alias in info.get("aliases", []):
+            out[alias] = out[name]
+    for alias, canonical in alias_to_canonical.items():
+        if canonical in out and alias not in out:
+            out[alias] = out[canonical]
     return out
 def main() -> None:
     global zeropower_via_newtonschulz5
@@ -1521,6 +1565,7 @@ def main() -> None:
                 lawa_state[name].add_(t.float())
         inv_k = 1.0 / float(len(lawa_queue))
         final_candidates.append(("lawa", {name: (t * inv_k) for name, t in lawa_state.items()}))
+    canonical_by_name, aliases_by_canonical, reuse_count_by_canonical = build_parameter_alias_groups(base_model)
     export_fp16_base_names = {
         "tok_emb.weight",
         "bigram.embed.weight",
@@ -1559,14 +1604,19 @@ def main() -> None:
             candidate_state,
             {"mlp", "attn"},
             export_fp16_base_names,
-            args.export_sensitive_fp16_topk,
-            args.export_sensitive_fp16_min_score,
+            canonical_by_name=canonical_by_name,
+            aliases_by_canonical=aliases_by_canonical,
+            reuse_count_by_canonical=reuse_count_by_canonical,
+            topk=args.export_sensitive_fp16_topk,
+            min_score=args.export_sensitive_fp16_min_score,
         )
         candidate_export_fp16_names = export_fp16_base_names | candidate_sensitive_fp16_names
         quant_result, quant_meta = mixed_quantize_int6(
             candidate_state,
             {"mlp", "attn"},
             candidate_export_fp16_names,
+            canonical_by_name=canonical_by_name,
+            aliases_by_canonical=aliases_by_canonical,
         )
         candidate_deq_state = dequantize_mixed_int6(quant_result, quant_meta, candidate_state)
         eval_model.load_state_dict(candidate_deq_state, strict=True)
@@ -1626,6 +1676,8 @@ def main() -> None:
         sd_cpu,
         {"mlp", "attn"},
         best_export_fp16_names,
+        canonical_by_name=canonical_by_name,
+        aliases_by_canonical=aliases_by_canonical,
     )
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
