@@ -794,6 +794,26 @@ def apply_groupwise_row_scales(t: Tensor, scales: Tensor, group_size: int) -> Te
         group_idx += 1
     return out
 
+def reconstruct_bitlinear_weight_latent(
+    ternary: Tensor,
+    scales: Tensor,
+    group_size: int,
+    dtype: torch.dtype = LOW_PRECISION_DTYPE,
+) -> Tensor:
+    reconstructed = apply_groupwise_row_scales(ternary.float(), scales.to(dtype=torch.float32), group_size)
+    if scales.ndim == 2 and scales.shape[1] > 1 and group_size > 0:
+        sparsity_chunks: list[Tensor] = []
+        for start in range(0, ternary.shape[1], group_size):
+            end = min(start + group_size, ternary.shape[1])
+            sparsity_chunks.append(
+                ternary[:, start:end].float().abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
+            )
+        sparsity = torch.cat(sparsity_chunks, dim=1)
+        sparsity = torch.repeat_interleave(sparsity, repeats=group_size, dim=1)[:, : ternary.shape[1]]
+    else:
+        sparsity = ternary.float().abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
+    return (reconstructed / sparsity).to(dtype).contiguous()
+
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
@@ -900,18 +920,7 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             shape = tuple(qmeta_item["shape"])
             group_size = int(qmeta_item.get("group_size", 0))
             ternary = unpack_ternary(q, shape, "cpu")
-            reconstructed = apply_groupwise_row_scales(ternary.float(), scale, group_size)
-            if scale.ndim == 2 and scale.shape[1] > 1:
-                sparsity = torch.empty((ternary.shape[0], scale.shape[1]), dtype=torch.float32)
-                group_idx = 0
-                for start in range(0, ternary.shape[1], group_size):
-                    end = min(start + group_size, ternary.shape[1])
-                    sparsity[:, group_idx : group_idx + 1] = ternary[:, start:end].float().abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
-                    group_idx += 1
-                out[name] = (reconstructed / torch.repeat_interleave(sparsity, repeats=group_size, dim=1)[:, : ternary.shape[1]]).to(LOW_PRECISION_DTYPE).contiguous()
-            else:
-                sparsity = ternary.float().abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
-                out[name] = (reconstructed / sparsity).to(LOW_PRECISION_DTYPE).contiguous()
+            out[name] = reconstruct_bitlinear_weight_latent(ternary, scale, group_size, dtype=LOW_PRECISION_DTYPE)
             continue
 
         dtype = getattr(torch, obj["dtypes"][name])
@@ -987,7 +996,7 @@ def pack_pgq2(quant_obj: dict) -> bytes:
             scheme_str = qmeta.get(name, {}).get("scheme", "per_tensor")
             orig_dt_str = dtypes[name]
             
-            if scheme_str == "ternary_packed":
+            if scheme_str in {"ternary_packed", "ternary_packed_group"}:
                 scheme_code = 12
             elif scheme_str == "per_row":
                 scheme_code = 2
@@ -1126,8 +1135,8 @@ def project_model_to_export_grid(model: nn.Module, include_small: bool = False) 
     for name, p in get_export_project_params(model, include_small=include_small):
         if name.endswith(".weight_latent"):
             ternary, scale = quantize_ternary_latent_tensor(p.data, BITLINEAR_GROUP_SIZE)
-            restored = apply_groupwise_row_scales(ternary.float(), scale.float(), BITLINEAR_GROUP_SIZE)
-            p.data.copy_(restored.to(dtype=p.dtype))
+            restored = reconstruct_bitlinear_weight_latent(ternary, scale, BITLINEAR_GROUP_SIZE, dtype=p.dtype)
+            p.data.copy_(restored)
             continue
 
         q, s = quantize_float_tensor(p.data)
@@ -1144,7 +1153,7 @@ def compute_export_grid_regularizer(model: nn.Module, include_small: bool = Fals
         target = p.detach()
         if name.endswith(".weight_latent"):
             ternary, scale = quantize_ternary_latent_tensor(target, BITLINEAR_GROUP_SIZE)
-            target = apply_groupwise_row_scales(ternary.float(), scale.float(), BITLINEAR_GROUP_SIZE).to(dtype=p.dtype)
+            target = reconstruct_bitlinear_weight_latent(ternary, scale, BITLINEAR_GROUP_SIZE, dtype=p.dtype)
         else:
             q, s = quantize_float_tensor(target)
             if s.ndim > 0:
